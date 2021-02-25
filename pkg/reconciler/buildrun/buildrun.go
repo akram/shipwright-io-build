@@ -188,15 +188,28 @@ func (r *ReconcileBuildRun) Reconcile(request reconcile.Request) (reconcile.Resu
 			return reconcile.Result{}, err
 		}
 	} else {
+		println("1 ########## Here %v ")
 		ctxlog.Info(ctx, "taskRun already exists", namespace, request.Namespace, name, request.Name)
 
 		err = r.GetBuildRunObject(ctx, lastTaskRun.Labels[buildv1alpha1.LabelBuildRun], request.Namespace, buildRun)
+		println(fmt.Sprintf("2 ########## Here %v", lastTaskRun))
+
 		if err != nil && !apierrors.IsNotFound(err) {
+			println(fmt.Sprintf("3 ########## Exit %v", lastTaskRun))
 			return reconcile.Result{}, err
 		} else if apierrors.IsNotFound(err) {
+			println(fmt.Sprintf("4 ########## Exit %v", lastTaskRun))
 			return reconcile.Result{}, nil
 		}
+		println(fmt.Sprintf("5 ########## Here %s", lastTaskRun.Spec.ServiceAccountName))
+		buildRun.Status = buildv1alpha1.BuildRunStatus{}
 		buildRun.Status.ServiceAccountName = &lastTaskRun.Spec.ServiceAccountName
+		println(fmt.Sprintf("6 ########## Here %v", r.client.Status()))
+
+		if err = r.client.Status().Update(ctx, buildRun); err != nil {
+			println(fmt.Sprintf("6 ########## Here %s", lastTaskRun.Spec.ServiceAccountName))
+			return reconcile.Result{}, err
+		}
 
 		// Check if the BuildRun is already finished, this happens if the build controller is restarted.
 		// It then reconciles all TaskRuns. This is valuable if the build controller was down while the TaskRun
