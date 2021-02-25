@@ -63,7 +63,7 @@ type BuildRunStatus struct {
 
 	// ServiceAccountName is the name of the serviceAccount used to run the build.
 	// +optional
-	ServiceAccountName *string `json:"serviceAccountName,omitempty"`
+	ServiceAccountName string `json:"serviceAccountName,omitempty"`
 
 	// StartTime is the time the build is actually started.
 	// +optional

@@ -304,7 +304,7 @@ func (c *Catalog) StubBuildRunStatus(reason string, name *string, condition buil
 	return func(context context.Context, object runtime.Object, _ ...crc.UpdateOption) error {
 		switch object := object.(type) {
 		case *build.BuildRun:
-			if !tolerateEmptyStatus || object.Status.Succeeded != "" {
+			if (!tolerateEmptyStatus || object.Status.Succeeded != "") && object.Status.Conditions != nil {
 				Expect(object.Status.GetCondition(build.Succeeded).Status).To(Equal(condition.Status))
 				Expect(object.Status.GetCondition(build.Succeeded).Reason).To(Equal(condition.Reason))
 				Expect(object.Status.Succeeded).To(Equal(status))

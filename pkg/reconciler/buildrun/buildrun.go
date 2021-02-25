@@ -150,7 +150,7 @@ func (r *ReconcileBuildRun) Reconcile(request reconcile.Request) (reconcile.Resu
 			ctxlog.Info(ctx, "creating TaskRun from BuildRun", namespace, request.Namespace, name, generatedTaskRun.GenerateName, "BuildRun", buildRun.Name)
 			if err = r.client.Create(ctx, generatedTaskRun); err != nil {
 				updateErr := r.updateBuildRunErrorStatus(ctx, buildRun, err.Error())
-				serviceAccountName := &generatedTaskRun.Spec.ServiceAccountName
+				serviceAccountName := generatedTaskRun.Spec.ServiceAccountName
 				buildRun.Status.ServiceAccountName = serviceAccountName
 				if err = r.client.Status().Update(ctx, buildRun); err != nil {
 					// we ignore the error here to prevent another reconciliation that would create another TaskRun,
@@ -163,7 +163,7 @@ func (r *ReconcileBuildRun) Reconcile(request reconcile.Request) (reconcile.Resu
 
 			// Set the LastTaskRunRef and the serviceAccountName in the BuildRun status
 			buildRun.Status.LatestTaskRunRef = &generatedTaskRun.Name
-			serviceAccountName := &generatedTaskRun.Spec.ServiceAccountName
+			serviceAccountName := generatedTaskRun.Spec.ServiceAccountName
 			buildRun.Status.ServiceAccountName = serviceAccountName
 			ctxlog.Info(ctx, "updating BuildRun status with TaskRun name and serviceAccountName", namespace, request.Namespace, name, request.Name, "TaskRun", generatedTaskRun.Name, "ServiceAccountName", serviceAccountName)
 			if err = r.client.Status().Update(ctx, buildRun); err != nil {
@@ -203,26 +203,31 @@ func (r *ReconcileBuildRun) Reconcile(request reconcile.Request) (reconcile.Resu
 		}
 		println(fmt.Sprintf("5 ########## Here %s", lastTaskRun.Spec.ServiceAccountName))
 		buildRun.Status = buildv1alpha1.BuildRunStatus{}
-		buildRun.Status.ServiceAccountName = &lastTaskRun.Spec.ServiceAccountName
+		buildRun.Status.ServiceAccountName = lastTaskRun.Spec.ServiceAccountName
 		println(fmt.Sprintf("6 ########## Here %v", r.client.Status()))
 
 		if err = r.client.Status().Update(ctx, buildRun); err != nil {
-			println(fmt.Sprintf("6 ########## Here %s", lastTaskRun.Spec.ServiceAccountName))
+			println(fmt.Sprintf("7 ########## Here %s", lastTaskRun.Spec.ServiceAccountName))
 			return reconcile.Result{}, err
 		}
+		println(fmt.Sprintf("8 ########## Here %s", buildRun.Status.ServiceAccountName))
 
 		// Check if the BuildRun is already finished, this happens if the build controller is restarted.
 		// It then reconciles all TaskRuns. This is valuable if the build controller was down while the TaskRun
 		// finishes which would be missed otherwise. But, if the TaskRun was already completed and the status
 		// synchronized into the BuildRun, then yet another reconciliation is not necessary.
 		if buildRun.Status.CompletionTime != nil {
+			println(fmt.Sprintf("9 ########## Here %s", buildRun.Status.ServiceAccountName))
 			ctxlog.Info(ctx, "buildRun already marked completed", namespace, request.Namespace, name, request.Name)
 			return reconcile.Result{}, nil
 		}
+		println(fmt.Sprintf("10 ########## Here %s", buildRun.Status.ServiceAccountName))
 
 		trCondition := lastTaskRun.Status.GetCondition(apis.ConditionSucceeded)
 		if trCondition != nil {
+			println(fmt.Sprintf("11 ########## Here %s", buildRun.Status.ServiceAccountName))
 			if err := resources.UpdateBuildRunUsingTaskRunCondition(ctx, r.client, buildRun, lastTaskRun, trCondition); err != nil {
+				println(fmt.Sprintf("12 ########## Here %s", buildRun.Status.ServiceAccountName))
 				return reconcile.Result{}, err
 			}
 
@@ -230,10 +235,11 @@ func (r *ReconcileBuildRun) Reconcile(request reconcile.Request) (reconcile.Resu
 
 			// check if we should delete the generated service account by checking the build run spec and that the task run is csomplete
 			if resources.IsGeneratedServiceAccountUsed(buildRun) && (taskRunStatus == corev1.ConditionTrue || taskRunStatus == corev1.ConditionFalse) {
+				println(fmt.Sprintf("13 ########## Here %s", buildRun.Status.ServiceAccountName))
 				serviceAccount := &corev1.ServiceAccount{}
 				serviceAccount.Name = resources.GetGeneratedServiceAccountName(buildRun)
 				serviceAccount.Namespace = buildRun.Namespace
-				buildRun.Status.ServiceAccountName = &serviceAccount.Name
+				buildRun.Status.ServiceAccountName = serviceAccount.Name
 
 				ctxlog.Info(ctx, "deleting service account", namespace, request.Namespace, name, request.Name)
 				if err = r.client.Delete(ctx, serviceAccount); err != nil && !apierrors.IsNotFound(err) {
@@ -241,6 +247,7 @@ func (r *ReconcileBuildRun) Reconcile(request reconcile.Request) (reconcile.Resu
 					return reconcile.Result{}, err
 				}
 			}
+			println(fmt.Sprintf("15 ########## Here %s", buildRun.Status.ServiceAccountName))
 
 			buildRun.Status.Succeeded = taskRunStatus
 			if taskRunStatus == corev1.ConditionFalse {
@@ -248,26 +255,33 @@ func (r *ReconcileBuildRun) Reconcile(request reconcile.Request) (reconcile.Resu
 			} else {
 				buildRun.Status.Reason = trCondition.Reason
 			}
+			println(fmt.Sprintf("18 ########## Here %s", buildRun.Status.ServiceAccountName))
 
 			buildRun.Status.LatestTaskRunRef = &lastTaskRun.Name
 
 			if buildRun.Status.StartTime == nil && lastTaskRun.Status.StartTime != nil {
 				buildRun.Status.StartTime = lastTaskRun.Status.StartTime
+				println(fmt.Sprintf("21 ########## Here %s", buildRun.Status.ServiceAccountName))
+				if buildRun.Status.BuildSpec != nil {
+					// Report the buildrun established duration (time between the creation of the buildrun and the start of the buildrun)
+					buildmetrics.BuildRunEstablishObserve(
+						buildRun.Status.BuildSpec.StrategyRef.Name,
+						buildRun.Namespace,
+						buildRun.Spec.BuildRef.Name,
+						buildRun.Name,
+						buildRun.Status.StartTime.Time.Sub(buildRun.CreationTimestamp.Time),
+					)
+				}
 
-				// Report the buildrun established duration (time between the creation of the buildrun and the start of the buildrun)
-				buildmetrics.BuildRunEstablishObserve(
-					buildRun.Status.BuildSpec.StrategyRef.Name,
-					buildRun.Namespace,
-					buildRun.Spec.BuildRef.Name,
-					buildRun.Name,
-					buildRun.Status.StartTime.Time.Sub(buildRun.CreationTimestamp.Time),
-				)
 			}
-
+			println(fmt.Sprintf("25 ########## Here %s", buildRun.Status.ServiceAccountName))
 			if lastTaskRun.Status.CompletionTime != nil && buildRun.Status.CompletionTime == nil {
 				buildRun.Status.CompletionTime = lastTaskRun.Status.CompletionTime
+				println(fmt.Sprintf("26 ########## Here %s", buildRun.Status.ServiceAccountName))
 
 				if buildRun.Status.BuildSpec.StrategyRef != nil {
+					println(fmt.Sprintf("27 ########## Here %s", buildRun.Status.ServiceAccountName))
+
 					// buildrun completion duration (total time between the creation of the buildrun and the buildrun completion)
 					buildmetrics.BuildRunCompletionObserve(
 						buildRun.Status.BuildSpec.StrategyRef.Name,
@@ -280,6 +294,8 @@ func (r *ReconcileBuildRun) Reconcile(request reconcile.Request) (reconcile.Resu
 					// Look for the pod created by the taskrun
 					var pod = &corev1.Pod{}
 					if err := r.client.Get(ctx, types.NamespacedName{Namespace: request.Namespace, Name: lastTaskRun.Status.PodName}, pod); err == nil {
+						println(fmt.Sprintf("28 ########## Here %s", buildRun.Status.ServiceAccountName))
+
 						if len(pod.Status.InitContainerStatuses) > 0 {
 
 							lastInitPodIdx := len(pod.Status.InitContainerStatuses) - 1
@@ -309,14 +325,18 @@ func (r *ReconcileBuildRun) Reconcile(request reconcile.Request) (reconcile.Resu
 					}
 				}
 			}
+			println(fmt.Sprintf("40 ########## Here %s", buildRun.Status.ServiceAccountName))
 
 			ctxlog.Info(ctx, "updating buildRun status", namespace, request.Namespace, name, request.Name)
 			if err = r.client.Status().Update(ctx, buildRun); err != nil {
+				println(fmt.Sprintf("41 ########## Here %s", buildRun.Status.ServiceAccountName))
 				return reconcile.Result{}, err
 			}
+			println(fmt.Sprintf("42 ########## Here %s", buildRun.Status.ServiceAccountName))
+
 		}
 	}
-
+	println(fmt.Sprintf("50 ########## Here %s", buildRun.Status.ServiceAccountName))
 	ctxlog.Debug(ctx, "finishing reconciling request from a BuildRun or TaskRun event", namespace, request.Namespace, name, request.Name)
 
 	return reconcile.Result{}, nil
