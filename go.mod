@@ -21,7 +21,7 @@ require (
 	k8s.io/code-generator v0.18.12
 	k8s.io/kube-openapi v0.0.0-20200805222855-6aeccd4b50c6
 	k8s.io/kubectl v0.18.10
-	k8s.io/utils v0.0.0-20200603063816-c1c6865ac451
+	k8s.io/utils v0.0.0-20200603063816-c1c6865ac451 // indirect
 	knative.dev/pkg v0.0.0-20210107022335-51c72e24c179
 	sigs.k8s.io/controller-runtime v0.6.1
 	sigs.k8s.io/yaml v1.2.0

@@ -138,7 +138,7 @@ var _ = Describe("Reconcile BuildRun", func() {
 					false,
 				)
 				statusWriter.UpdateCalls(statusCall)
-				taskRunSample.Spec.ServiceAccountName = "toto"
+				taskRunSample.Spec.ServiceAccountName = "my-sa"
 				result, err := reconciler.Reconcile(taskRunRequest)
 				Expect(err).ToNot(HaveOccurred())
 				Expect(reconcile.Result{}).To(Equal(result))

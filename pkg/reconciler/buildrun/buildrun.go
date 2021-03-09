@@ -192,7 +192,7 @@ func (r *ReconcileBuildRun) Reconcile(request reconcile.Request) (reconcile.Resu
 		ctxlog.Info(ctx, "taskRun already exists", namespace, request.Namespace, name, request.Name)
 
 		err = r.GetBuildRunObject(ctx, lastTaskRun.Labels[buildv1alpha1.LabelBuildRun], request.Namespace, buildRun)
-		println(fmt.Sprintf("2 ########## Here %v", lastTaskRun))
+		println(fmt.Sprintf("2 ########## Here %+v", lastTaskRun))
 
 		if err != nil && !apierrors.IsNotFound(err) {
 			println(fmt.Sprintf("3 ########## Exit %v", lastTaskRun))
