@@ -3,7 +3,7 @@ module github.com/shipwright-io/build
 go 1.15
 
 require (
-	github.com/go-git/go-git/v5 v5.2.0
+	github.com/go-git/go-git/v5 v5.3.1-0.20210421110026-67d34902b0c4
 	github.com/go-logr/logr v0.4.0
 	github.com/go-logr/zapr v0.4.0 // indirect
 	github.com/go-openapi/spec v0.20.2
@@ -12,7 +12,7 @@ require (
 	github.com/prometheus/client_golang v1.8.0
 	github.com/prometheus/client_model v0.2.0
 	github.com/spf13/pflag v1.0.5
-	github.com/tektoncd/pipeline v0.21.0
+	github.com/tektoncd/pipeline v0.23.0
 	go.uber.org/zap v1.16.0
 	k8s.io/api v0.20.2
 	k8s.io/apimachinery v0.20.2

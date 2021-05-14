@@ -117,9 +117,9 @@ kubectl apply -f samples/buildstrategy/kaniko/buildstrategy_kaniko_cr.yaml
 
 ## BuildKit
 
-[BuildKit](https://github.com/moby/buildkit) is composed of the `buildctl` client and the `buildkitd` daemon. For the `buildkit` ClusterBuildStrategy, it runs on a [daemonless](https://github.com/moby/buildkit#daemonless) mode, where both client and ephemeral daemon run in a single container. In addition, it runs without privileges ( _[rootless](https://github.com/moby/buildkit/blob/master/docs/rootless.md)_ ).
+[BuildKit](https://github.com/moby/buildkit) is composed of the `buildctl` client and the `buildkitd` daemon. For the `buildkit` ClusterBuildStrategy, it runs on a [daemonless](https://github.com/moby/buildkit#daemonless) mode, where both client and ephemeral daemon run in a single container. In addition, it runs without privileges (_[rootless](https://github.com/moby/buildkit/blob/master/docs/rootless.md)_).
 
-The `buildkit-insecure` ClusterBuildStrategy exists to support users pushing to an insecure HTTP registry. We use this strategy at the moment only for testing purposes against a local in-cluster registry. In the future, this strategy will be removed in favor of a single one where users can parameterize the secure/insecure behaviour.
+The `buildkit-insecure` ClusterBuildStrategy exists to support users pushing to an insecure container registry. We use this strategy at the moment only for testing purposes against a local in-cluster registry. In the future, this strategy will be removed in favor of a single one where users can parameterize the secure/insecure behaviour.
 
 ### Cache Exporters
 
@@ -130,8 +130,20 @@ By default, the `buildkit` ClusterBuildStrategy will use caching to optimize the
 The `buildkit` ClusterBuildStrategy currently locks the following parameters:
 
 - A `Dockerfile` name needs to be `Dockerfile`, this is currently not configurable.
-- Exporter caches are enable by default, this is currently not configurable.
+- Exporter caches are enabled by default, this is currently not configurable.
 - To allow running rootless, it requires both [AppArmor](https://kubernetes.io/docs/tutorials/clusters/apparmor/) as well as [SecComp](https://kubernetes.io/docs/tutorials/clusters/seccomp/) to be disabled using the `unconfined` profile.
+
+### Usage in Clusters with Pod Security Standards
+
+The BuildKit strategy contains fields with regards to security settings. It therefore depends on the respective cluster setup and administrative configuration. These settings are:
+
+- Defining the `unconfined` profile for both AppArmor and seccomp as required by the underlying `rootlesskit`.
+- The `allowPrivilegeEscalation` settings is set to `true` to be able to use binaries that have the `setuid` bit set in order to run with "root" level privileges. In case of BuildKit, this is required by `rootlesskit` in order to set the user namespace mapping file `/proc/<pid>/uid_map`.
+- Use of non-root user with UID 1000/GID 1000 as the `runAsUser`.
+
+These settings have no effect in case Pod Security Standards are not used.
+
+_Please note:_ At this point in time, there is no way to run `rootlesskit` to start the BuildKit daemon without the `allowPrivilegeEscalation` flag set to `true`. Clusters with the `Restricted` security standard in place will not be able to use this build strategy.
 
 ### Installing BuildKit Strategy
 
@@ -187,6 +199,16 @@ kubectl apply -f samples/buildstrategy/source-to-image/buildstrategy_source-to-i
 [s2i]: https://github.com/openshift/source-to-image
 [buildah]: https://github.com/containers/buildah
 
+## System parameters
+
+You can use parameters when defining the steps of a build strategy to access system information as well as information provided by the user in his Build or BuildRun. The following parameters are available:
+
+| Parameter                      | Description |
+| ------------------------------ | ----------- |
+| `$(params.shp-source-root)`    | The absolute path to the directory that contains the user's sources. |
+| `$(params.shp-source-context)` | The absolute path to the context directory of the user's sources. If the user specified no value for `spec.source.contextDir` in his Build, then this value will equal the value for `$(params.shp-source-root)`. Note that this directory is not guaranteed to exist at the time the container for your step is started, you can therefore not use this parameter as a step's working directory. |
+| `$(params.shp-output-image)`      | The URL of the image that the user wants to push as specified in the Build's `spec.output.image`, or the override from the BuildRun's `spec.output.image`. |
+
 ## Steps Resource Definition
 
 All strategies steps can include a definition of resources(_limits and requests_) for CPU, memory and disk. For strategies with more than one step, each step(_container_) could require more resources than others. Strategy admins are free to define the values that they consider the best fit for each step. Also, identical strategies with the same steps that are only different in their name and step resources can be installed on the cluster to allow users to create a build with smaller and larger resource requirements.
@@ -204,8 +226,8 @@ metadata:
 spec:
   buildSteps:
     - name: build-and-push
-      image: gcr.io/kaniko-project/executor:v1.5.2
-      workingDir: /workspace/source
+      image: gcr.io/kaniko-project/executor:v1.6.0
+      workingDir: $(params.shp-source-root)
       securityContext:
         runAsUser: 0
         capabilities:
@@ -229,8 +251,8 @@ spec:
       args:
         - --skip-tls-verify=true
         - --dockerfile=$(build.dockerfile)
-        - --context=/workspace/source/$(build.source.contextDir)
-        - --destination=$(build.output.image)
+        - --context=$(params.shp-source-context)
+        - --destination=$(params.shp-output-image)
         - --oci-layout-path=/workspace/output/image
         - --snapshotMode=redo
         - --push-retry=3
@@ -249,8 +271,8 @@ metadata:
 spec:
   buildSteps:
     - name: build-and-push
-      image: gcr.io/kaniko-project/executor:v1.5.2
-      workingDir: /workspace/source
+      image: gcr.io/kaniko-project/executor:v1.6.0
+      workingDir: $(params.shp-source-root)
       securityContext:
         runAsUser: 0
         capabilities:
@@ -274,8 +296,8 @@ spec:
       args:
         - --skip-tls-verify=true
         - --dockerfile=$(build.dockerfile)
-        - --context=/workspace/source/$(build.source.contextDir)
-        - --destination=$(build.output.image)
+        - --context=$(params.shp-source-context)
+        - --destination=$(params.shp-output-image)
         - --oci-layout-path=/workspace/output/image
         - --snapshotMode=redo
         - --push-retry=3
@@ -402,15 +424,15 @@ If we will apply the following resources:
 
   ```yaml
     - name: buildah-bud
-      image: quay.io/buildah/stable:latest
-      workingDir: /workspace/source
+      image: quay.io/containers/buildah:v1.20.1
+      workingDir: $(params.shp-source-root)
       securityContext:
         privileged: true
       command:
         - /usr/bin/buildah
       args:
         - bud
-        - --tag=$(build.output.image)
+        - --tag=$(params.shp-output-image)
         - --file=$(build.dockerfile)
         - $(build.source.contextDir)
       resources:
@@ -424,7 +446,7 @@ If we will apply the following resources:
         - name: buildah-images
           mountPath: /var/lib/containers/storage
     - name: buildah-push
-      image: quay.io/buildah/stable:latest
+      image: quay.io/containers/buildah:v1.20.1
       securityContext:
         privileged: true
       command:
@@ -432,7 +454,7 @@ If we will apply the following resources:
       args:
         - push
         - --tls-verify=false
-        - docker://$(build.output.image)
+        - docker://$(params.shp-output-image)
       resources:
         limits:
           cpu: 500m

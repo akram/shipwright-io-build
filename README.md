@@ -134,6 +134,7 @@ To find out more on what's the best strategy or what else can Shipwright do for 
 | Version | Docs                           | Examples                    |
 | ------- | ------------------------------ | --------------------------- |
 | HEAD    | [Docs @ HEAD](/docs/README.md) | [Examples @ HEAD](/samples) |
+| [v0.4.0](https://github.com/shipwright-io/build/releases/tag/v0.4.0)    | [Docs @ v0.4.0](https://github.com/shipwright-io/build/tree/v0.4.0/docs) | [Examples @ v0.4.0](https://github.com/shipwright-io/build/tree/v0.4.0/samples) |
 | [v0.3.0](https://github.com/shipwright-io/build/releases/tag/v0.3.0)    | [Docs @ v0.3.0](https://github.com/shipwright-io/build/tree/v0.3.0/docs) | [Examples @ v0.3.0](https://github.com/shipwright-io/build/tree/v0.3.0/samples) |
 | [v0.2.0](https://github.com/shipwright-io/build/releases/tag/v0.2.0)    | [Docs @ v0.2.0](https://github.com/shipwright-io/build/tree/v0.2.0/docs) | [Examples @ v0.2.0](https://github.com/shipwright-io/build/tree/v0.2.0/samples) |
 | [v0.1.1](https://github.com/shipwright-io/build/releases/tag/v0.1.1)    | [Docs @ v0.1.1](https://github.com/shipwright-io/build/tree/v0.1.1/docs) | [Examples @ v0.1.1](https://github.com/shipwright-io/build/tree/v0.1.1/samples) |
@@ -144,7 +145,7 @@ To find out more on what's the best strategy or what else can Shipwright do for 
 | Dependency                           | Supported versions           |
 | -------------------------------------| ---------------------------- |
 | [Kubernetes](https://kubernetes.io/) | v1.17.\*, v1.18.\*, v1.19.\*, v1.20.\* |
-| [Tekton](https://tekton.dev)         | v0.19.0, v0.20.\*, v0.21.0   |
+| [Tekton](https://tekton.dev)         | v0.19.0, v0.20.\*, v0.21.0, v0.22.0, v0.23.0 |
 
 ### Platform support
 

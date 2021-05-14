@@ -48,12 +48,12 @@ In order to prevent users from triggering `BuildRuns` (_execution of a Build_) t
 
 | Status.Reason | Description |
 | --- | --- |
-| BuildStrategyNotFound   | The referenced namespace-scope strategy doesn´t exist. |
-| ClusterBuildStrategyNotFound   | The referenced cluster-scope strategy doesn´t exist. |
+| BuildStrategyNotFound   | The referenced namespace-scope strategy doesn't exist. |
+| ClusterBuildStrategyNotFound   | The referenced cluster-scope strategy doesn't exist. |
 | SetOwnerReferenceFailed   | Setting ownerreferences between a Build and a BuildRun failed. This is triggered when making use of the `build.shipwright.io/build-run-deletion` annotation in a Build. |
-| SpecSourceSecretNotFound | The secret used to authenticate to git doesn´t exist. |
-| SpecOutputSecretRefNotFound | The secret used to authenticate to the container registry doesn´t exist. |
-| SpecBuilderSecretRefNotFound | The secret used to authenticate to the container registry doesn´t exist.|
+| SpecSourceSecretRefNotFound | The secret used to authenticate to git doesn't exist. |
+| SpecOutputSecretRefNotFound | The secret used to authenticate to the container registry doesn't exist. |
+| SpecBuilderSecretRefNotFound | The secret used to authenticate to the container registry doesn't exist.|
 | MultipleSecretRefNotFound | More than one secret is missing. At the moment, only three paths on a Build can specify a secret. |
 | RuntimePathsCanNotBeEmpty | The Runtime feature is used, but the runtime path was not defined. This is mandatory. |
 | RemoteRepositoryUnreachable | The defined `spec.source.url` was not found. This validation only take place for http/https protocols. |
@@ -151,11 +151,12 @@ spec:
 
 A `Build` resource can specify the `BuildStrategy` to use, these are:
 
-- [Source-to-Image](buildstrategies.md#source-to-image)
-- [Buildpacks-v3](buildstrategies.md#buildpacks-v3)
 - [Buildah](buildstrategies.md#buildah)
+- [Buildpacks-v3](buildstrategies.md#buildpacks-v3)
+- [BuildKit](buildstrategies.md#buildkit)
 - [Kaniko](buildstrategies.md#kaniko)
-* [ko](docs/buildstrategies.md#ko)
+- [ko](buildstrategies.md#ko)
+- [Source-to-Image](buildstrategies.md#source-to-image)
 
 Defining the strategy is straightforward, you need to define the `name` and the `kind`. For example:
 
@@ -198,7 +199,8 @@ metadata:
   name: s2i-nodejs-build
 spec:
   source:
-    url: https://github.com/sclorg/nodejs-ex
+    url: https://github.com/shipwright-io/sample-nodejs
+    contextDir: source-build/
   strategy:
     name: source-to-image
     kind: ClusterBuildStrategy
@@ -219,7 +221,8 @@ metadata:
   name: s2i-nodejs-build
 spec:
   source:
-    url: https://github.com/sclorg/nodejs-ex
+    url: https://github.com/shipwright-io/sample-nodejs
+    contextDir: source-build/
   strategy:
     name: source-to-image
     kind: ClusterBuildStrategy
@@ -238,7 +241,8 @@ metadata:
   name: s2i-nodejs-build
 spec:
   source:
-    url: https://github.com/sclorg/nodejs-ex
+    url: https://github.com/shipwright-io/sample-nodejs
+    contextDir: source-build/
   strategy:
     name: source-to-image
     kind: ClusterBuildStrategy
@@ -330,7 +334,7 @@ Please consider the description of the attributes under `.spec.runtime`:
 > Specifying the runtime section will cause a `BuildRun` to push `spec.output.image` twice. First, the image produced by chosen `BuildStrategy` is pushed, and next it gets reused to construct the runtime-image, which is pushed again, overwriting `BuildStrategy` outcome.
 > Be aware, specially in situations where the image push action triggers automation steps. Since the same tag will be reused, you might need to take this in consideration when using runtime-images.
 
-Under the cover, the runtime image will be an additional step in the generated Task spec of the TaskRun. It uses [Kaniko](https://github.com/GoogleContainerTools/kaniko) to run a container build using the `gcr.io/kaniko-project/executor:v1.5.2` image. You can overwrite this image by adding the environment variable `KANIKO_CONTAINER_IMAGE` to the [build controller deployment](../deploy/controller.yaml).
+Under the cover, the runtime image will be an additional step in the generated Task spec of the TaskRun. It uses [Kaniko](https://github.com/GoogleContainerTools/kaniko) to run a container build using the `gcr.io/kaniko-project/executor:v1.6.0` image. You can overwrite this image by adding the environment variable `KANIKO_CONTAINER_IMAGE` to the [build controller deployment](../deploy/controller.yaml).
 
 ## BuildRun deletion
 

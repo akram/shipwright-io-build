@@ -15,17 +15,17 @@ metadata:
 spec:
   buildSteps:
     - name: buildah-bud
-      image: quay.io/buildah/stable:latest
-      workingDir: /workspace/source
+      image: quay.io/containers/buildah:v1.20.1
+      workingDir: $(params.shp-source-root)
       securityContext:
         privileged: true
       command:
         - /usr/bin/buildah
       args:
         - bud
-        - --tag=$(build.output.image)
+        - --tag=$(params.shp-output-image)
         - --file=$(build.dockerfile)
-        - $(build.source.contextDir)
+        - $(params.shp-source-context)
       resources:
         limits:
           cpu: 500m
@@ -37,7 +37,7 @@ spec:
         - name: buildah-images
           mountPath: /var/lib/containers/storage
     - name: buildah-push
-      image: quay.io/buildah/stable:latest
+      image: quay.io/containers/buildah:v1.20.1
       securityContext:
         privileged: true
       command:
@@ -45,7 +45,7 @@ spec:
       args:
         - push
         - --tls-verify=false
-        - docker://$(build.output.image)
+        - docker://$(params.shp-output-image)
       resources:
         limits:
           cpu: 100m
@@ -75,7 +75,7 @@ spec:
   buildSteps:
     - name: build
       image: "$(build.builder.image)"
-      workingDir: /workspace/source
+      workingDir: $(params.shp-source-root)
       command:
         - buildah
         - bud
@@ -84,8 +84,8 @@ spec:
         - -f
         - $(build.dockerfile)
         - -t
-        - $(build.output.image)
-        - $(build.source.contextDir)
+        - $(params.shp-output-image)
+        - $(params.shp-source-context)
       resources:
         limits:
           cpu: 500m
@@ -110,11 +110,11 @@ spec:
   buildSteps:
     - name: build
       image: "$(build.builder.image)"
-      workingDir: /workspace/source
+      workingDir: $(params.shp-source-root)
       command:
         - /cnb/lifecycle/builder
         - -app
-        - /workspace/source
+        - $(params.shp-source-context)
         - -layers
         - /layers
         - -group
