@@ -17,7 +17,6 @@
 package verify
 
 import (
-	"bytes"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -38,6 +37,18 @@ type verifyReader struct {
 	gotSize, wantSize int64
 }
 
+// Error provides information about the failed hash verification.
+type Error struct {
+	got     string
+	want    v1.Hash
+	gotSize int64
+}
+
+func (v Error) Error() string {
+	return fmt.Sprintf("error verifying %s checksum after reading %d bytes; got %q, want %q",
+		v.want.Algorithm, v.gotSize, v.got, v.want)
+}
+
 // Read implements io.Reader
 func (vc *verifyReader) Read(b []byte) (int, error) {
 	n, err := vc.inner.Read(b)
@@ -46,10 +57,13 @@ func (vc *verifyReader) Read(b []byte) (int, error) {
 		if vc.wantSize != SizeUnknown && vc.gotSize != vc.wantSize {
 			return n, fmt.Errorf("error verifying size; got %d, want %d", vc.gotSize, vc.wantSize)
 		}
-		got := hex.EncodeToString(vc.hasher.Sum(make([]byte, 0, vc.hasher.Size())))
+		got := hex.EncodeToString(vc.hasher.Sum(nil))
 		if want := vc.expected.Hex; got != want {
-			return n, fmt.Errorf("error verifying %s checksum after reading %d bytes; got %q, want %q",
-				vc.expected.Algorithm, vc.gotSize, got, want)
+			return n, Error{
+				got:     vc.expected.Algorithm + ":" + got,
+				want:    vc.expected,
+				gotSize: vc.gotSize,
+			}
 		}
 	}
 	return n, err
@@ -69,9 +83,9 @@ func ReadCloser(r io.ReadCloser, size int64, h v1.Hash) (io.ReadCloser, error) {
 	if err != nil {
 		return nil, err
 	}
-	var r2 io.Reader = r
+	r2 := io.TeeReader(r, w) // pass all writes to the hasher.
 	if size != SizeUnknown {
-		r2 = io.LimitReader(io.TeeReader(r, w), size)
+		r2 = io.LimitReader(r2, size) // if we know the size, limit to that size.
 	}
 	return &and.ReadCloser{
 		Reader: &verifyReader{
@@ -92,10 +106,16 @@ func Descriptor(d v1.Descriptor) error {
 		return errors.New("error verifying descriptor; Data == nil")
 	}
 
-	h, sz, err := v1.SHA256(bytes.NewReader(d.Data))
+	hasher, err := v1.Hasher(d.Digest.Algorithm)
 	if err != nil {
 		return err
 	}
+	hasher.Write(d.Data)
+	h := v1.Hash{
+		Algorithm: d.Digest.Algorithm,
+		Hex:       hex.EncodeToString(hasher.Sum(make([]byte, 0, hasher.Size()))),
+	}
+	sz := int64(len(d.Data))
 	if h != d.Digest {
 		return fmt.Errorf("error verifying Digest; got %q, want %q", h, d.Digest)
 	}

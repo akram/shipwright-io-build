@@ -1,0 +1,79 @@
+---
+# This workflow downloads the latest release and checks it for OS and Go vulnerabilities.
+# An issue is opened with a summary    
+name: Report release vulnerabilities
+on:
+  schedule:
+    - cron: '0 4 * * *' # 4:00 am UTC = 1 hour after base image build
+  release:
+    types:
+      - edited
+      - published
+  workflow_dispatch: {}
+jobs:
+  report-vulnerabilities:
+    if: ${{ github.repository == 'shipwright-io/build' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          path: main
+      - name: Install Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.26.x'
+          cache: true
+          check-latest: true
+      - name: Install crane
+        run: curl --location --silent "https://github.com/google/go-containerregistry/releases/download/$(curl -s https://api.github.com/repos/google/go-containerregistry/releases/latest | jq -r '.tag_name')/go-containerregistry_$(uname -s)_$(uname -m | sed -e 's/aarch64/arm64/').tar.gz" | sudo tar -xzf - -C /usr/local/bin crane
+      - name: Install dyff
+        run: curl --silent --location https://raw.githubusercontent.com/homeport/dyff/main/scripts/download-latest.sh | bash
+      - name: Install Ko
+        uses: ko-build/setup-ko@v0.10
+        with:
+          version: v0.19.1
+      - name: Install Retry
+        run: curl --location --silent  https://raw.githubusercontent.com/homeport/retry/main/hack/download.sh | bash
+      - name: Install semver
+        run: go install gitlab.com/usvc/utils/semver/cmd/semver@latest
+      - name: Install Grype
+        run: |
+          TAG_NAME="$(curl -s https://api.github.com/repos/anchore/grype/releases/latest | jq -r '.tag_name')"
+          curl -L -s "https://github.com/anchore/grype/releases/download/${TAG_NAME}/grype_${TAG_NAME/v/}_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed -e 's/aarch64/arm64/' -e 's/x86_64/amd64/').tar.gz" | sudo tar -xzf - -C /usr/local/bin grype
+      - name: Install Trivy
+        run: make install-trivy
+        working-directory: ${{ github.workspace }}/main
+      - name: Update Trivy database
+        env:
+          TRIVY_USERNAME: ${{ github.repository_owner }}
+          TRIVY_PASSWORD: ${{ github.token }}
+        run: retry trivy image --download-db-only --disable-telemetry --skip-version-check
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+      - name: Download latest release
+        id: download-latest-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./.github/download-latest-release.sh
+        working-directory: ${{ github.workspace }}/main
+      - name: Checkout release branch
+        uses: actions/checkout@v6
+        with:
+          path: release-branch
+          ref: ${{ steps.download-latest-release.outputs.release-branch }}
+      - name: Install Go version of latest release
+        uses: actions/setup-go@v7
+        with:
+          go-version: "${{ steps.download-latest-release.outputs.go-version }}.x"
+          cache: true
+          check-latest: true
+      - name: Report vulnerabilities
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_BRANCH: ${{ steps.download-latest-release.outputs.release-branch }}
+          RELEASE_TAG: ${{ steps.download-latest-release.outputs.release-tag }}
+          RELEASE_YAML: ${{ steps.download-latest-release.outputs.release-yaml }}
+          REPOSITORY: ${{ github.workspace }}/release-branch
+        run: ./.github/report-release-vulnerabilities.sh
+        working-directory: ${{ github.workspace }}/main

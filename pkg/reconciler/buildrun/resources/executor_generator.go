@@ -1,0 +1,105 @@
+// Copyright The Shipwright Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
+package resources
+
+import (
+	"fmt"
+
+	corev1 "k8s.io/api/core/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	buildapi "github.com/shipwright-io/build/pkg/apis/build/v1beta1"
+	"github.com/shipwright-io/build/pkg/env"
+)
+
+// executionContext holds shared state for build execution generation.
+type executionContext struct {
+	combinedEnvs       []corev1.EnvVar
+	volumeMounts       map[string]bool
+	strategyVolumes    []buildapi.BuildStrategyVolume
+	buildVolumes       []buildapi.BuildVolume
+	buildRunVolumes    []buildapi.BuildVolume
+	hasOutputDirectory bool
+}
+
+func prepareExecutionContext(
+	build *buildapi.Build,
+	buildRun *buildapi.BuildRun,
+	strategy buildapi.BuilderStrategy,
+) (*executionContext, error) {
+	combinedEnvs, err := mergeEnvironmentVariables(build, buildRun)
+	if err != nil {
+		return nil, fmt.Errorf("failed to merge environment variables: %w", err)
+	}
+
+	return &executionContext{
+		combinedEnvs:    combinedEnvs,
+		volumeMounts:    make(map[string]bool),
+		strategyVolumes: strategy.GetVolumes(),
+		buildVolumes:    build.Spec.Volumes,
+		buildRunVolumes: buildRun.Spec.Volumes,
+	}, nil
+}
+
+func mergeEnvironmentVariables(build *buildapi.Build, buildRun *buildapi.BuildRun) ([]corev1.EnvVar, error) {
+	return env.MergeEnvVars(buildRun.Spec.Env, build.Spec.Env, true)
+}
+
+// BuildRunExecutorGenerator generates build execution objects (TaskRun or PipelineRun).
+type BuildRunExecutorGenerator interface {
+	// InitializeExecutor creates the base executor with metadata and default settings.
+	InitializeExecutor() error
+	// GenerateSourceAcquisitionPhase configures steps for fetching source code into the workspace.
+	GenerateSourceAcquisitionPhase(execCtx *executionContext) error
+	// GenerateBuildStrategyPhase configures the main build steps from the BuildStrategy.
+	GenerateBuildStrategyPhase(execCtx *executionContext) error
+	// GenerateOutputImagePhase configures steps for pushing the built image to the registry.
+	GenerateOutputImagePhase(execCtx *executionContext) error
+	// ApplyInfrastructureConfiguration applies service accounts, node selectors, tolerations, and timeouts.
+	ApplyInfrastructureConfiguration() error
+	// ApplyMetadataConfiguration applies labels, annotations, and owner references.
+	ApplyMetadataConfiguration() error
+	// GetExecutor returns the fully configured executor object.
+	GetExecutor() client.Object
+}
+
+// GenerateBuildRunExecutor orchestrates build execution generation.
+func GenerateBuildRunExecutor(
+	build *buildapi.Build,
+	buildRun *buildapi.BuildRun,
+	strategy buildapi.BuilderStrategy,
+	generator BuildRunExecutorGenerator,
+) (client.Object, error) {
+	execCtx, err := prepareExecutionContext(build, buildRun, strategy)
+	if err != nil {
+		return nil, fmt.Errorf("preparing execution context: %w", err)
+	}
+
+	if err := generator.InitializeExecutor(); err != nil {
+		return nil, fmt.Errorf("initializing executor: %w", err)
+	}
+
+	if err := generator.GenerateSourceAcquisitionPhase(execCtx); err != nil {
+		return nil, fmt.Errorf("source acquisition: %w", err)
+	}
+
+	if err := generator.GenerateBuildStrategyPhase(execCtx); err != nil {
+		return nil, fmt.Errorf("build strategy: %w", err)
+	}
+
+	if err := generator.GenerateOutputImagePhase(execCtx); err != nil {
+		return nil, fmt.Errorf("output image: %w", err)
+	}
+
+	if err := generator.ApplyInfrastructureConfiguration(); err != nil {
+		return nil, fmt.Errorf("infrastructure configuration: %w", err)
+	}
+
+	if err := generator.ApplyMetadataConfiguration(); err != nil {
+		return nil, fmt.Errorf("metadata configuration: %w", err)
+	}
+
+	return generator.GetExecutor(), nil
+}

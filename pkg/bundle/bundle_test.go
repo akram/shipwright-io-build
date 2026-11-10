@@ -5,36 +5,149 @@
 package bundle_test
 
 import (
-	"io/ioutil"
+	"archive/tar"
+	"bytes"
+	"fmt"
+	"log"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 
-	. "github.com/onsi/ginkgo"
+	"github.com/google/go-containerregistry/pkg/name"
+	"github.com/google/go-containerregistry/pkg/registry"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"k8s.io/apimachinery/pkg/util/rand"
 
 	. "github.com/shipwright-io/build/pkg/bundle"
 )
 
 var _ = Describe("Bundle", func() {
+	withTempDir := func(f func(tempDir string)) {
+		tempDir, err := os.MkdirTemp("", "bundle")
+		Expect(err).ToNot(HaveOccurred())
+		defer os.RemoveAll(tempDir)
+		f(tempDir)
+	}
+
+	withTempRegistry := func(f func(endpoint string)) {
+		logLogger := log.Logger{}
+		logLogger.SetOutput(GinkgoWriter)
+
+		s := httptest.NewServer(
+			registry.New(
+				registry.Logger(&logLogger),
+				registry.WithReferrersSupport(true),
+			),
+		)
+		defer s.Close()
+
+		u, err := url.Parse(s.URL)
+		Expect(err).ToNot(HaveOccurred())
+
+		f(u.Host)
+	}
+
 	Context("packing and unpacking", func() {
 		It("should pack and unpack a directory", func() {
-			r, err := Pack("../../test/bundle")
-			Expect(err).ToNot(HaveOccurred())
-			Expect(r).ToNot(BeNil())
+			withTempDir(func(tempDir string) {
+				r, err := Pack(filepath.Join("..", "..", "test", "bundle"))
+				Expect(err).ToNot(HaveOccurred())
+				Expect(r).ToNot(BeNil())
 
-			tempDir, err := ioutil.TempDir("", "bundle")
-			Expect(err).ToNot(HaveOccurred())
-			defer os.RemoveAll(tempDir)
+				details, err := Unpack(r, tempDir)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(details).ToNot(BeNil())
 
-			err = Unpack(r, tempDir)
-			Expect(err).ToNot((HaveOccurred()))
+				Expect(filepath.Join(tempDir, "README.md")).To(BeAnExistingFile())
+				Expect(filepath.Join(tempDir, ".someToolDir", "config.json")).ToNot(BeAnExistingFile())
+				Expect(filepath.Join(tempDir, "somefile")).To(BeAnExistingFile())
+				Expect(filepath.Join(tempDir, "linktofile")).To(BeAnExistingFile())
+			})
+		})
 
-			Expect(filepath.Join(tempDir, "README.md")).To(BeAnExistingFile())
+		It("should pack and unpack a directory including all files even if a sub-directory is non-writable", func() {
+			withTempDir(func(source string) {
+				// Setup a case where there are files in a directory, which is non-writable
+				Expect(os.Mkdir(filepath.Join(source, "some-dir"), os.FileMode(0777))).To(Succeed())
+				Expect(os.WriteFile(filepath.Join(source, "some-dir", "some-file"), []byte(`foobar`), os.FileMode(0644))).To(Succeed())
+				Expect(os.Chmod(filepath.Join(source, "some-dir"), os.FileMode(0555))).To(Succeed())
 
-			Expect(filepath.Join(tempDir, ".someToolDir", "config.json")).ToNot(BeAnExistingFile())
+				r, err := Pack(source)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(r).ToNot(BeNil())
 
-			Expect(filepath.Join(tempDir, "somefile")).To(BeAnExistingFile())
-			Expect(filepath.Join(tempDir, "linktofile")).To(BeAnExistingFile())
+				withTempDir(func(target string) {
+					details, err := Unpack(r, target)
+					Expect(err).ToNot(HaveOccurred())
+					Expect(details).ToNot(BeNil())
+
+					Expect(filepath.Join(target, "some-dir", "some-file")).To(BeAnExistingFile())
+				})
+			})
+		})
+
+		DescribeTable("should reject a tar entry that attempts to escape the target directory",
+			func(entryName string) {
+				withTempDir(func(outerDir string) {
+					// nested four levels deep so that the "../../../../etc/canary"
+					// payload still escapes targetDir while resolving to a path
+					// inside outerDir, not the host's real /etc
+					targetDir := filepath.Join(outerDir, "a", "b", "c", "target")
+					Expect(os.MkdirAll(targetDir, os.FileMode(0755))).To(Succeed())
+
+					// where the malicious entry would land if it were not rejected
+					escapedPath := filepath.Join(targetDir, entryName)
+
+					var buf bytes.Buffer
+					tw := tar.NewWriter(&buf)
+					Expect(tw.WriteHeader(&tar.Header{
+						Name:     entryName,
+						Typeflag: tar.TypeReg,
+						Mode:     0644,
+						Size:     int64(len("owned")),
+					})).To(Succeed())
+					_, err := tw.Write([]byte("owned"))
+					Expect(err).ToNot(HaveOccurred())
+					Expect(tw.Close()).To(Succeed())
+
+					_, err = Unpack(&buf, targetDir)
+					Expect(err).To(HaveOccurred())
+					Expect(err.Error()).To(ContainSubstring("escapes the target directory"))
+
+					Expect(escapedPath).ToNot(BeAnExistingFile())
+				})
+			},
+			Entry("single level traversal", "../canary"),
+			Entry("deep traversal matching the reported issue", "../../../../etc/canary"),
+		)
+	})
+
+	Context("packing/pushing and pulling/unpacking", func() {
+		It("should pull and unpack an image", func() {
+			withTempRegistry(func(endpoint string) {
+				ref, err := name.ParseReference(fmt.Sprintf("%s/namespace/unit-test-pkg-bundle-%s:latest", endpoint, rand.String(5)))
+				Expect(err).ToNot(HaveOccurred())
+
+				By("packing and pushing an image", func() {
+					_, err := PackAndPush(ref, filepath.Join("..", "..", "test", "bundle"))
+					Expect(err).ToNot(HaveOccurred())
+				})
+
+				By("pulling and unpacking the image", func() {
+					withTempDir(func(tempDir string) {
+						image, err := PullAndUnpack(ref, tempDir)
+						Expect(err).ToNot(HaveOccurred())
+						Expect(image).ToNot(BeNil())
+
+						Expect(filepath.Join(tempDir, "README.md")).To(BeAnExistingFile())
+						Expect(filepath.Join(tempDir, ".someToolDir", "config.json")).ToNot(BeAnExistingFile())
+						Expect(filepath.Join(tempDir, "somefile")).To(BeAnExistingFile())
+						Expect(filepath.Join(tempDir, "linktofile")).To(BeAnExistingFile())
+					})
+				})
+			})
 		})
 	})
 })

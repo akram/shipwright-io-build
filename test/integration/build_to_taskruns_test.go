@@ -5,19 +5,24 @@
 package integration_test
 
 import (
-	. "github.com/onsi/ginkgo"
+	"strings"
+
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/utils/ptr"
 
-	"github.com/shipwright-io/build/pkg/apis/build/v1alpha1"
-	"github.com/shipwright-io/build/test"
+	buildapi "github.com/shipwright-io/build/pkg/apis/build/v1beta1"
+	utils "github.com/shipwright-io/build/test/utils/v1beta1"
+	test "github.com/shipwright-io/build/test/v1beta1_samples"
 )
 
 var _ = Describe("Integration tests Build and TaskRun", func() {
 	var (
-		cbsObject      *v1alpha1.ClusterBuildStrategy
-		buildObject    *v1alpha1.Build
-		buildRunObject *v1alpha1.BuildRun
+		cbsObject      *buildapi.ClusterBuildStrategy
+		buildObject    *buildapi.Build
+		buildRunObject *buildapi.BuildRun
 		buildSample,
 		buildRunSample []byte
 	)
@@ -30,6 +35,7 @@ var _ = Describe("Integration tests Build and TaskRun", func() {
 		err = tb.CreateClusterBuildStrategy(cbsObject)
 		Expect(err).To(BeNil())
 	})
+
 	// Delete the ClusterBuildStrategies after each test case
 	AfterEach(func() {
 		_, err = tb.GetBuild(buildObject.Name)
@@ -72,9 +78,9 @@ var _ = Describe("Integration tests Build and TaskRun", func() {
 				buildObject, err = tb.GetBuildTillValidation(buildObject.Name)
 				Expect(err).To(BeNil())
 
-				Expect(buildObject.Status.Registered).To(Equal(corev1.ConditionTrue))
-				Expect(buildObject.Status.Reason).To(Equal(v1alpha1.SucceedStatus))
-				Expect(buildObject.Status.Message).To(Equal(v1alpha1.AllValidationsSucceeded))
+				Expect(*buildObject.Status.Registered).To(Equal(corev1.ConditionTrue))
+				Expect(*buildObject.Status.Reason).To(Equal(buildapi.SucceedStatus))
+				Expect(*buildObject.Status.Message).To(Equal(buildapi.AllValidationsSucceeded))
 			})
 
 			It("should be successful with label value as empty string", func() {
@@ -87,9 +93,9 @@ var _ = Describe("Integration tests Build and TaskRun", func() {
 				buildObject, err = tb.GetBuildTillValidation(buildObject.Name)
 				Expect(err).To(BeNil())
 
-				Expect(buildObject.Status.Registered).To(Equal(corev1.ConditionTrue))
-				Expect(buildObject.Status.Reason).To(Equal(v1alpha1.SucceedStatus))
-				Expect(buildObject.Status.Message).To(Equal(v1alpha1.AllValidationsSucceeded))
+				Expect(*buildObject.Status.Registered).To(Equal(corev1.ConditionTrue))
+				Expect(*buildObject.Status.Reason).To(Equal(buildapi.SucceedStatus))
+				Expect(*buildObject.Status.Message).To(Equal(buildapi.AllValidationsSucceeded))
 			})
 
 			It("should be successful with annotation", func() {
@@ -102,9 +108,9 @@ var _ = Describe("Integration tests Build and TaskRun", func() {
 				buildObject, err = tb.GetBuildTillValidation(buildObject.Name)
 				Expect(err).To(BeNil())
 
-				Expect(buildObject.Status.Registered).To(Equal(corev1.ConditionTrue))
-				Expect(buildObject.Status.Reason).To(Equal(v1alpha1.SucceedStatus))
-				Expect(buildObject.Status.Message).To(Equal(v1alpha1.AllValidationsSucceeded))
+				Expect(*buildObject.Status.Registered).To(Equal(corev1.ConditionTrue))
+				Expect(*buildObject.Status.Reason).To(Equal(buildapi.SucceedStatus))
+				Expect(*buildObject.Status.Message).To(Equal(buildapi.AllValidationsSucceeded))
 			})
 
 			It("should be successful with label", func() {
@@ -117,9 +123,9 @@ var _ = Describe("Integration tests Build and TaskRun", func() {
 				buildObject, err = tb.GetBuildTillValidation(buildObject.Name)
 				Expect(err).To(BeNil())
 
-				Expect(buildObject.Status.Registered).To(Equal(corev1.ConditionTrue))
-				Expect(buildObject.Status.Reason).To(Equal(v1alpha1.SucceedStatus))
-				Expect(buildObject.Status.Message).To(Equal(v1alpha1.AllValidationsSucceeded))
+				Expect(*buildObject.Status.Registered).To(Equal(corev1.ConditionTrue))
+				Expect(*buildObject.Status.Reason).To(Equal(buildapi.SucceedStatus))
+				Expect(*buildObject.Status.Message).To(Equal(buildapi.AllValidationsSucceeded))
 			})
 
 			It("should be successful with both label and annotation", func() {
@@ -137,14 +143,27 @@ var _ = Describe("Integration tests Build and TaskRun", func() {
 				buildObject, err = tb.GetBuildTillValidation(buildObject.Name)
 				Expect(err).To(BeNil())
 
-				Expect(buildObject.Status.Registered).To(Equal(corev1.ConditionTrue))
-				Expect(buildObject.Status.Reason).To(Equal(v1alpha1.SucceedStatus))
-				Expect(buildObject.Status.Message).To(Equal(v1alpha1.AllValidationsSucceeded))
+				Expect(*buildObject.Status.Registered).To(Equal(corev1.ConditionTrue))
+				Expect(*buildObject.Status.Reason).To(Equal(buildapi.SucceedStatus))
+				Expect(*buildObject.Status.Message).To(Equal(buildapi.AllValidationsSucceeded))
+			})
+
+			It("should set the buildrun controller as a field manager", func() {
+				Expect(tb.CreateBuild(buildObject)).To(Succeed())
+
+				buildObject, err = tb.GetBuildTillValidation(buildObject.Name)
+				Expect(err).NotTo(HaveOccurred())
+
+				fieldManagers := sets.NewString()
+				for _, field := range buildObject.GetObjectMeta().GetManagedFields() {
+					fieldManagers.Insert(field.Manager)
+				}
+				Expect(fieldManagers).To(HaveKey("shipwright-build-controller"), "build controller should be registered as a field manager")
 			})
 		})
 
 		Context("when creating the taskrun", func() {
-			It("should contain a step to mutate the image", func() {
+			It("should contain an image-processing step to mutate the image", func() {
 				buildObject.Spec.Output.Annotations =
 					map[string]string{
 						"org.opencontainers.image.url": "https://my-company.com/images",
@@ -162,17 +181,20 @@ var _ = Describe("Integration tests Build and TaskRun", func() {
 				tr, err := tb.GetTaskRunFromBuildRun(buildRunObject.Name)
 				Expect(err).To(BeNil())
 
-				Expect(tr.Spec.TaskSpec.Steps[3].Name).To(Equal("mutate-image"))
-				Expect(tr.Spec.TaskSpec.Steps[3].Command[0]).To(Equal("/ko-app/mutate-image"))
+				Expect(tr.Spec.TaskSpec.Steps[3].Name).To(Equal("image-processing"))
+				Expect(tr.Spec.TaskSpec.Steps[3].Command[0]).To(Equal("/ko-app/image-processing"))
 				Expect(tr.Spec.TaskSpec.Steps[3].Args).To(Equal([]string{
-					"--image",
-					"$(params.shp-output-image)",
-					"--result-file-image-digest",
-					"$(results.shp-image-digest.path)",
-					"result-file-image-size",
-					"$(results.shp-image-size.path)",
 					"--annotation",
 					"org.opencontainers.image.url=https://my-company.com/images",
+					"--image",
+					"$(params.shp-output-image)",
+					"--insecure=$(params.shp-output-insecure)",
+					"--result-file-image-digest",
+					"$(results.shp-image-digest.path)",
+					"--result-file-image-size",
+					"$(results.shp-image-size.path)",
+					"--result-file-image-vulnerabilities",
+					"$(results.shp-image-vulnerabilities.path)",
 				}))
 			})
 
@@ -193,9 +215,137 @@ var _ = Describe("Integration tests Build and TaskRun", func() {
 				tr, err := tb.GetTaskRunFromBuildRun(buildRunObject.Name)
 				Expect(err).To(BeNil())
 
-				for _, step := range tr.Spec.TaskSpec.Steps {
-					Expect(step.Name).ToNot(Equal("mutate-image"))
-				}
+				Expect(tr.Spec.TaskSpec.Steps).ToNot(utils.ContainNamedElement("image-processing"))
+			})
+		})
+	})
+
+	Context("when a build with nodeSelector is defined", func() {
+		BeforeEach(func() {
+			buildSample = []byte(test.MinimalBuildWithNodeSelector)
+			buildRunSample = []byte(test.MinimalBuildRun)
+		})
+
+		Context("when the TaskRun is created", func() {
+			It("should have the nodeSelector specified in the PodTemplate", func() {
+				Expect(tb.CreateBuild(buildObject)).To(BeNil())
+
+				buildObject, err = tb.GetBuildTillValidation(buildObject.Name)
+				Expect(err).To(BeNil())
+				Expect(*buildObject.Status.Message).To(Equal(buildapi.AllValidationsSucceeded))
+				Expect(*buildObject.Status.Registered).To(Equal(corev1.ConditionTrue))
+				Expect(*buildObject.Status.Reason).To(Equal(buildapi.SucceedStatus))
+
+				Expect(tb.CreateBR(buildRunObject)).To(BeNil())
+
+				_, err = tb.GetBRTillStartTime(buildRunObject.Name)
+				Expect(err).To(BeNil())
+
+				tr, err := tb.GetTaskRunFromBuildRun(buildRunObject.Name)
+				Expect(err).To(BeNil())
+				Expect(buildObject.Spec.NodeSelector).To(Equal(tr.Spec.PodTemplate.NodeSelector))
+			})
+		})
+
+		Context("when the nodeSelector is invalid", func() {
+			It("fails the build with a proper error in Reason", func() {
+				// set nodeSelector label to be invalid
+				buildObject.Spec.NodeSelector = map[string]string{strings.Repeat("s", 64): ""}
+				Expect(tb.CreateBuild(buildObject)).To(BeNil())
+
+				buildObject, err = tb.GetBuildTillValidation(buildObject.Name)
+				Expect(err).To(BeNil())
+
+				Expect(*buildObject.Status.Registered).To(Equal(corev1.ConditionFalse))
+				Expect(*buildObject.Status.Reason).To(Equal(buildapi.NodeSelectorNotValid))
+			})
+		})
+	})
+
+	Context("when a build with Tolerations is defined", func() {
+		BeforeEach(func() {
+			buildSample = []byte(test.MinimalBuildWithToleration)
+			buildRunSample = []byte(test.MinimalBuildRun)
+		})
+
+		Context("when the TaskRun is created", func() {
+			It("should have the Tolerations specified in the PodTemplate", func() {
+				Expect(tb.CreateBuild(buildObject)).To(BeNil())
+
+				buildObject, err = tb.GetBuildTillValidation(buildObject.Name)
+				Expect(err).To(BeNil())
+				Expect(*buildObject.Status.Message).To(Equal(buildapi.AllValidationsSucceeded))
+				Expect(*buildObject.Status.Registered).To(Equal(corev1.ConditionTrue))
+				Expect(*buildObject.Status.Reason).To(Equal(buildapi.SucceedStatus))
+
+				Expect(tb.CreateBR(buildRunObject)).To(BeNil())
+
+				_, err = tb.GetBRTillStartTime(buildRunObject.Name)
+				Expect(err).To(BeNil())
+
+				tr, err := tb.GetTaskRunFromBuildRun(buildRunObject.Name)
+				Expect(err).To(BeNil())
+				Expect(buildObject.Spec.Tolerations[0].Key).To(Equal(tr.Spec.PodTemplate.Tolerations[0].Key))
+				Expect(buildObject.Spec.Tolerations[0].Operator).To(Equal(tr.Spec.PodTemplate.Tolerations[0].Operator))
+				Expect(buildObject.Spec.Tolerations[0].Value).To(Equal(tr.Spec.PodTemplate.Tolerations[0].Value))
+				Expect(tr.Spec.PodTemplate.Tolerations[0].TolerationSeconds).To(Equal(corev1.Toleration{}.TolerationSeconds))
+				Expect(tr.Spec.PodTemplate.Tolerations[0].Effect).To(Equal(corev1.TaintEffectNoSchedule))
+			})
+		})
+
+		Context("when the Toleration is invalid", func() {
+			It("fails the build with a proper error in Reason", func() {
+				// set Toleration Key to be invalid
+				buildObject.Spec.Tolerations[0].Key = strings.Repeat("s", 64)
+				Expect(tb.CreateBuild(buildObject)).To(BeNil())
+
+				buildObject, err = tb.GetBuildTillValidation(buildObject.Name)
+				Expect(err).To(BeNil())
+
+				Expect(*buildObject.Status.Registered).To(Equal(corev1.ConditionFalse))
+				Expect(*buildObject.Status.Reason).To(Equal(buildapi.TolerationNotValid))
+			})
+		})
+	})
+
+	Context("when a build with SchedulerName is defined", func() {
+		BeforeEach(func() {
+			buildSample = []byte(test.MinimalBuildWithSchedulerName)
+			buildRunSample = []byte(test.MinimalBuildRun)
+		})
+
+		Context("when the TaskRun is created", func() {
+			It("should have the SchedulerName specified in the PodTemplate", func() {
+				Expect(tb.CreateBuild(buildObject)).To(BeNil())
+
+				buildObject, err = tb.GetBuildTillValidation(buildObject.Name)
+				Expect(err).To(BeNil())
+				Expect(*buildObject.Status.Message).To(Equal(buildapi.AllValidationsSucceeded))
+				Expect(*buildObject.Status.Registered).To(Equal(corev1.ConditionTrue))
+				Expect(*buildObject.Status.Reason).To(Equal(buildapi.SucceedStatus))
+
+				Expect(tb.CreateBR(buildRunObject)).To(BeNil())
+
+				_, err = tb.GetBRTillStartTime(buildRunObject.Name)
+				Expect(err).To(BeNil())
+
+				tr, err := tb.GetTaskRunFromBuildRun(buildRunObject.Name)
+				Expect(err).To(BeNil())
+				Expect(tr.Spec.PodTemplate.SchedulerName).To(Equal(*buildObject.Spec.SchedulerName))
+			})
+		})
+
+		Context("when the SchedulerName is invalid", func() {
+			It("fails the build with a proper error in Reason", func() {
+				// set SchedulerName to be invalid
+				buildObject.Spec.SchedulerName = ptr.To(strings.Repeat("s", 64))
+				Expect(tb.CreateBuild(buildObject)).To(BeNil())
+
+				buildObject, err = tb.GetBuildTillValidation(buildObject.Name)
+				Expect(err).To(BeNil())
+
+				Expect(*buildObject.Status.Registered).To(Equal(corev1.ConditionFalse))
+				Expect(*buildObject.Status.Reason).To(Equal(buildapi.SchedulerNameNotValid))
 			})
 		})
 	})

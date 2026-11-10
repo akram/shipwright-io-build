@@ -8,7 +8,6 @@ import (
 	"context"
 
 	"github.com/go-logr/logr"
-
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
 
@@ -43,8 +42,13 @@ func NewContext(ctx context.Context, name string) context.Context {
 // which in this case is an instance of our logger
 func ExtractLogger(ctx context.Context) logr.Logger {
 	log, ok := ctx.Value(loggerKey).(logr.Logger)
-	if !ok || log == nil {
-		return logf.NullLogger{}
+	if !ok || log.GetSink() == nil {
+		if logger, err := logr.FromContext(ctx); err == nil {
+			log = logger
+		}
+		if log.GetSink() == nil {
+			log = log.WithSink(logf.NullLogSink{})
+		}
 	}
 	return log
 }

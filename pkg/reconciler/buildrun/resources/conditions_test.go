@@ -7,20 +7,21 @@ package resources_test
 import (
 	"context"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	build "github.com/shipwright-io/build/pkg/apis/build/v1alpha1"
-	"github.com/shipwright-io/build/pkg/controller/fakes"
-	"github.com/shipwright-io/build/pkg/reconciler/buildrun/resources"
-	"github.com/shipwright-io/build/test"
-	"github.com/tektoncd/pipeline/pkg/apis/pipeline/v1beta1"
+	pipelineapi "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1"
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"knative.dev/pkg/apis"
+	crc "sigs.k8s.io/controller-runtime/pkg/client"
+
+	buildapi "github.com/shipwright-io/build/pkg/apis/build/v1beta1"
+	"github.com/shipwright-io/build/pkg/controller/fakes"
+	"github.com/shipwright-io/build/pkg/reconciler/buildrun/resources"
+	test "github.com/shipwright-io/build/test/v1beta1_samples"
 )
 
 var _ = Describe("Conditions", func() {
@@ -37,7 +38,7 @@ var _ = Describe("Conditions", func() {
 
 			// BuildRun implements StatusConditions, therefore it can operate on
 			// an existing Condition
-			msg := br.Status.GetCondition(build.Succeeded).GetMessage()
+			msg := br.Status.GetCondition(buildapi.Succeeded).GetMessage()
 			Expect(msg).To(Equal("foo is not bar"))
 		})
 
@@ -45,7 +46,7 @@ var _ = Describe("Conditions", func() {
 			// BuildRun sample with an embedded condition of the type Succeeded
 			br := ctl.BuildRunWithSucceededCondition()
 
-			reason := br.Status.GetCondition(build.Succeeded).GetReason()
+			reason := br.Status.GetCondition(buildapi.Succeeded).GetReason()
 			Expect(reason).To(Equal("foobar"))
 		})
 
@@ -53,7 +54,7 @@ var _ = Describe("Conditions", func() {
 			// BuildRun sample with an embedded condition of the type Succeeded
 			br := ctl.BuildRunWithSucceededCondition()
 
-			status := br.Status.GetCondition(build.Succeeded).GetStatus()
+			status := br.Status.GetCondition(buildapi.Succeeded).GetStatus()
 			Expect(status).To(Equal(corev1.ConditionUnknown))
 		})
 
@@ -62,16 +63,15 @@ var _ = Describe("Conditions", func() {
 
 			// when getting a condition that does not exists on the BuildRun, do not
 			// panic but rather return a nil
-			cond := br.Status.GetCondition(build.Succeeded)
+			cond := br.Status.GetCondition(buildapi.Succeeded)
 			Expect(cond).To(BeNil())
 		})
 
 		It("should be able to set a condition based on a type", func() {
 			br := ctl.DefaultBuildRun("foo", "bar")
-
 			// generate a condition of the type Succeeded
-			tmpCond := &build.Condition{
-				Type:               build.Succeeded,
+			tmpCond := &buildapi.Condition{
+				Type:               buildapi.Succeeded,
 				Status:             corev1.ConditionUnknown,
 				Message:            "foobar",
 				Reason:             "foo is bar",
@@ -81,11 +81,11 @@ var _ = Describe("Conditions", func() {
 			// set the condition on the BuildRun resource
 			br.Status.SetCondition(tmpCond)
 
-			condition := br.Status.GetCondition(build.Succeeded)
+			condition := br.Status.GetCondition(buildapi.Succeeded)
 			Expect(condition).ToNot(BeNil())
-			Expect(condition.Type).To(Equal(build.Succeeded))
+			Expect(condition.Type).To(Equal(buildapi.Succeeded))
 
-			condMsg := br.Status.GetCondition(build.Succeeded).GetMessage()
+			condMsg := br.Status.GetCondition(buildapi.Succeeded).GetMessage()
 			Expect(condMsg).To(Equal("foobar"))
 		})
 
@@ -93,12 +93,12 @@ var _ = Describe("Conditions", func() {
 			// BuildRun sample with an embedded condition of the type Succeeded
 			br := ctl.BuildRunWithSucceededCondition()
 
-			reason := br.Status.GetCondition(build.Succeeded).GetReason()
+			reason := br.Status.GetCondition(buildapi.Succeeded).GetReason()
 			Expect(reason).To(Equal("foobar"))
 
 			// generate a condition in order to update the existing one
-			tmpCond := &build.Condition{
-				Type:               build.Succeeded,
+			tmpCond := &buildapi.Condition{
+				Type:               buildapi.Succeeded,
 				Status:             corev1.ConditionUnknown,
 				Message:            "foobar was updated",
 				Reason:             "foo is bar",
@@ -108,7 +108,7 @@ var _ = Describe("Conditions", func() {
 			// update the condition on the BuildRun resource
 			br.Status.SetCondition(tmpCond)
 
-			condMsg := br.Status.GetCondition(build.Succeeded).GetMessage()
+			condMsg := br.Status.GetCondition(buildapi.Succeeded).GetMessage()
 			Expect(condMsg).To(Equal("foobar was updated"))
 		})
 
@@ -117,8 +117,8 @@ var _ = Describe("Conditions", func() {
 		var (
 			client *fakes.FakeClient
 			ctl    test.Catalog
-			br     *build.BuildRun
-			tr     *v1beta1.TaskRun
+			br     *buildapi.BuildRun
+			tr     *pipelineapi.TaskRun
 		)
 
 		tr = ctl.TaskRunWithStatus("foo", "bar")
@@ -145,7 +145,7 @@ var _ = Describe("Conditions", func() {
 		It("updates BuildRun condition when TaskRun fails and pod not found", func() {
 
 			// stub a GET API call that fails with not found
-			getClientStub := func(context context.Context, nn types.NamespacedName, object runtime.Object) error {
+			getClientStub := func(_ context.Context, nn types.NamespacedName, object crc.Object, _ ...crc.GetOption) error {
 				switch object.(type) {
 				case *corev1.Pod:
 					return k8serrors.NewNotFound(schema.GroupResource{}, nn.Name)
@@ -202,7 +202,7 @@ var _ = Describe("Conditions", func() {
 			}
 
 			// stub a GET API call with taskRunGeneratedPod
-			getClientStub := func(context context.Context, nn types.NamespacedName, object runtime.Object) error {
+			getClientStub := func(_ context.Context, nn types.NamespacedName, object crc.Object, _ ...crc.GetOption) error {
 				switch object := object.(type) {
 				case *corev1.Pod:
 					taskRunGeneratedPod.DeepCopyInto(object)
@@ -229,8 +229,8 @@ var _ = Describe("Conditions", func() {
 			)).To(BeNil())
 		})
 
-		It("updates BuildRun condition when TaskRun fails and pod is evicted", func() {
-			// Generate a pod with the status to be evicted
+		It("updates BuildRun condition when TaskRun fails in vulnerability scan in image-processing step", func() {
+			// Generate a pod with name step-image-processing and exitCode 22
 			failedTaskRunEvictedPod := corev1.Pod{
 				ObjectMeta: metav1.ObjectMeta{
 					Name: "evilpod",
@@ -238,17 +238,27 @@ var _ = Describe("Conditions", func() {
 				Spec: corev1.PodSpec{
 					Containers: []corev1.Container{
 						{
-							Name: "evilpod-container",
+							Name: "step-image-processing",
 						},
 					},
 				},
 				Status: corev1.PodStatus{
-					Reason: "Evicted",
+					Reason: "VulnerabilityScanFailed",
+					ContainerStatuses: []corev1.ContainerStatus{
+						{
+							Name: "step-image-processing",
+							State: corev1.ContainerState{
+								Terminated: &corev1.ContainerStateTerminated{
+									ExitCode: 22,
+								},
+							},
+						},
+					},
 				},
 			}
 
 			// stub a GET API call with to pass the created pod
-			getClientStub := func(context context.Context, nn types.NamespacedName, object runtime.Object) error {
+			getClientStub := func(_ context.Context, nn types.NamespacedName, object crc.Object, _ ...crc.GetOption) error {
 				switch object := object.(type) {
 				case *corev1.Pod:
 					failedTaskRunEvictedPod.DeepCopyInto(object)
@@ -278,8 +288,124 @@ var _ = Describe("Conditions", func() {
 
 			// Finally, check the output of the buildRun
 			Expect(br.Status.GetCondition(
-				build.Succeeded).Reason,
-			).To(Equal(build.BuildRunStatePodEvicted))
+				buildapi.Succeeded).Reason,
+			).To(Equal(buildapi.BuildRunStateVulnerabilitiesFound))
+		})
+
+		It("updates BuildRun condition when TaskRun fails and pod is evicted", func() {
+			// Generate a pod with the status to be evicted
+			failedTaskRunEvictedPod := corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "evilpod",
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{
+							Name: "evilpod-container",
+						},
+					},
+				},
+				Status: corev1.PodStatus{
+					Phase:  corev1.PodFailed,
+					Reason: "Evicted",
+				},
+			}
+
+			// stub a GET API call with to pass the created pod
+			getClientStub := func(_ context.Context, nn types.NamespacedName, object crc.Object, _ ...crc.GetOption) error {
+				switch object := object.(type) {
+				case *corev1.Pod:
+					failedTaskRunEvictedPod.DeepCopyInto(object)
+					return nil
+				}
+				return k8serrors.NewNotFound(schema.GroupResource{}, nn.Name)
+			}
+
+			// fake the calls with the above stub
+			client.GetCalls(getClientStub)
+
+			// Now we need to create a fake failed taskrun so that it hits the code
+			fakeTRCondition := &apis.Condition{
+				Type:    apis.ConditionSucceeded,
+				Reason:  "Failed",
+				Message: "not relevant",
+			}
+
+			// We call the function with all the info
+			Expect(resources.UpdateBuildRunUsingTaskRunCondition(
+				context.TODO(),
+				client,
+				br,
+				tr,
+				fakeTRCondition,
+			)).To(BeNil())
+
+			// Finally, check the output of the buildRun
+			Expect(br.Status.GetCondition(
+				buildapi.Succeeded).Reason,
+			).To(Equal(buildapi.BuildRunStatePodEvicted))
+		})
+
+		It("updates BuildRun condition when TaskRun fails and container is out of memory", func() {
+			// Generate a pod with the status to out of memory
+			failedTaskRunOOMContainer := corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "evilpod",
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{
+							Name: "evilpod-container",
+						},
+					},
+				},
+				Status: corev1.PodStatus{
+					Phase: corev1.PodFailed,
+					ContainerStatuses: []corev1.ContainerStatus{{
+						Name: "evilpod-container",
+						State: corev1.ContainerState{
+							Terminated: &corev1.ContainerStateTerminated{
+								ExitCode: 1,
+								Reason:   "OOMKilled",
+							},
+						},
+					}},
+				},
+			}
+
+			// stub a GET API call with to pass the created pod
+			getClientStub := func(_ context.Context, nn types.NamespacedName, object crc.Object, _ ...crc.GetOption) error {
+				switch object := object.(type) {
+				case *corev1.Pod:
+					failedTaskRunOOMContainer.DeepCopyInto(object)
+					return nil
+				}
+				return k8serrors.NewNotFound(schema.GroupResource{}, nn.Name)
+			}
+
+			// fake the calls with the above stub
+			client.GetCalls(getClientStub)
+
+			// Now we need to create a fake failed taskrun so that it hits the code
+			fakeTRCondition := &apis.Condition{
+				Type:    apis.ConditionSucceeded,
+				Reason:  "Failed",
+				Message: "not relevant",
+			}
+
+			// We call the function with all the info
+			Expect(resources.UpdateBuildRunUsingTaskRunCondition(
+				context.TODO(),
+				client,
+				br,
+				tr,
+				fakeTRCondition,
+			)).To(BeNil())
+
+			// Finally, check the output of the buildRun
+			Expect(br.Status.GetCondition(
+				buildapi.Succeeded).Reason,
+			).To(Equal(buildapi.BuildRunStateStepOutOfMemory))
 		})
 
 		It("updates a BuildRun condition when the related TaskRun fails and pod containers are not available", func() {
@@ -291,7 +417,7 @@ var _ = Describe("Conditions", func() {
 			}
 
 			// stub a GET API call with the above taskRunGeneratedPod spec
-			getClientStub := func(context context.Context, nn types.NamespacedName, object runtime.Object) error {
+			getClientStub := func(_ context.Context, nn types.NamespacedName, object crc.Object, getOptions ...crc.GetOption) error {
 				switch object := object.(type) {
 				case *corev1.Pod:
 					taskRunGeneratedPod.DeepCopyInto(object)

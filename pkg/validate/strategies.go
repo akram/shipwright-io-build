@@ -7,132 +7,117 @@ package validate
 import (
 	"context"
 	"fmt"
-	"strings"
 
-	build "github.com/shipwright-io/build/pkg/apis/build/v1alpha1"
-	"github.com/shipwright-io/build/pkg/ctxlog"
-	"github.com/shipwright-io/build/pkg/reconciler/buildrun/resources"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	buildapi "github.com/shipwright-io/build/pkg/apis/build/v1beta1"
+	"github.com/shipwright-io/build/pkg/ctxlog"
 )
 
 // Strategy contains all required fields
 // to validate a Build spec strategy definition
 type Strategy struct {
-	Build  *build.Build
+	Build  *buildapi.Build
 	Client client.Client
+}
+
+func NewStrategies(client client.Client, build *buildapi.Build) *Strategy {
+	return &Strategy{build, client}
 }
 
 // ValidatePath implements BuildPath interface and validates
 // that the referenced strategy exists. This applies to both
 // namespaced or cluster scoped strategies
 func (s Strategy) ValidatePath(ctx context.Context) error {
-	if s.Build.Spec.Strategy != nil {
-		buildStrategy := &build.BuildStrategy{}
-		if s.Build.Spec.Strategy.Kind != nil {
-			switch *s.Build.Spec.Strategy.Kind {
-			case build.NamespacedBuildStrategyKind:
-				if err := s.validateBuildStrategy(ctx, s.Build.Spec.Strategy.Name, buildStrategy); err != nil {
-					return err
-				}
-				if err := s.validateBuildParams(buildStrategy.Spec.Parameters); err != nil {
-					return err
-				}
-			case build.ClusterBuildStrategyKind:
-				clusterBuildStrategy := &build.ClusterBuildStrategy{}
-				if err := s.validateClusterBuildStrategy(ctx, s.Build.Spec.Strategy.Name, clusterBuildStrategy); err != nil {
-					return err
-				}
-				if err := s.validateBuildParams(clusterBuildStrategy.Spec.Parameters); err != nil {
-					return err
-				}
-			default:
-				return fmt.Errorf("unknown strategy kind: %v", *s.Build.Spec.Strategy.Kind)
-			}
-		} else {
-			ctxlog.Info(ctx, "buildStrategy kind is nil, use default NamespacedBuildStrategyKind", namespace, s.Build.Namespace, name, s.Build.Name)
-			if err := s.validateBuildStrategy(ctx, s.Build.Spec.Strategy.Name, buildStrategy); err != nil {
-				return err
-			}
-			if err := s.validateBuildParams(buildStrategy.Spec.Parameters); err != nil {
-				return err
-			}
-		}
+	switch s.kind(ctx) {
+	case buildapi.NamespacedBuildStrategyKind:
+		return s.validateBuildStrategy(ctx, s.Build.Spec.Strategy.Name)
+
+	case buildapi.ClusterBuildStrategyKind:
+		return s.validateClusterBuildStrategy(ctx, s.Build.Spec.Strategy.Name)
+
+	default:
+		s.Build.Status.Reason = ptr.To[buildapi.BuildReason](buildapi.UnknownBuildStrategyKind)
+		s.Build.Status.Message = ptr.To(fmt.Sprintf("unknown strategy kind %s used, must be one of %s, or %s",
+			*s.Build.Spec.Strategy.Kind,
+			buildapi.NamespacedBuildStrategyKind,
+			buildapi.ClusterBuildStrategyKind))
+		return nil
 	}
-	return nil
 }
 
-func (s Strategy) validateBuildStrategy(ctx context.Context, strategyName string, buildStrategy *build.BuildStrategy) error {
-	if err := s.Client.Get(ctx, types.NamespacedName{Name: strategyName, Namespace: s.Build.Namespace}, buildStrategy); err != nil && !apierrors.IsNotFound(err) {
-		return err
-	} else if apierrors.IsNotFound(err) {
-		s.Build.Status.Reason = build.BuildStrategyNotFound
-		s.Build.Status.Message = fmt.Sprintf("buildStrategy %s does not exist in namespace %s", s.Build.Spec.Strategy.Name, s.Build.Namespace)
+func (s Strategy) kind(ctx context.Context) buildapi.BuildStrategyKind {
+	if s.Build.Spec.Strategy.Kind == nil {
+		ctxlog.Info(ctx, "buildStrategy kind is nil, use default NamespacedBuildStrategyKind", namespace, s.Build.Namespace, name, s.Build.Name)
+		return buildapi.NamespacedBuildStrategyKind
 	}
 
-	return nil
+	return *s.Build.Spec.Strategy.Kind
 }
 
-func (s Strategy) validateClusterBuildStrategy(ctx context.Context, strategyName string, clusterBuildStrategy *build.ClusterBuildStrategy) error {
-	if err := s.Client.Get(ctx, types.NamespacedName{Name: strategyName}, clusterBuildStrategy); err != nil && !apierrors.IsNotFound(err) {
-		return err
-	} else if apierrors.IsNotFound(err) {
-		s.Build.Status.Reason = build.ClusterBuildStrategyNotFound
-		s.Build.Status.Message = fmt.Sprintf("clusterBuildStrategy %s does not exist", s.Build.Spec.Strategy.Name)
-	}
-	return nil
-}
-
-func (s Strategy) validateBuildParams(parameters []build.Parameter) error {
-
-	if len(s.Build.Spec.ParamValues) == 0 {
+func (s Strategy) validateBuildStrategy(ctx context.Context, strategyName string) error {
+	buildStrategy := &buildapi.BuildStrategy{}
+	err := s.Client.Get(ctx, types.NamespacedName{Name: strategyName, Namespace: s.Build.Namespace}, buildStrategy)
+	if err == nil {
+		s.validateBuildParams(buildStrategy.GetParameters())
+		s.validateBuildVolumes(buildStrategy.GetVolumes())
+		s.validateStepResources(buildStrategy.GetBuildSteps())
 		return nil
 	}
 
-	// Check that the Build param is defined in the strategies parameters
-	s.validateParamsInStrategies(s.Build.Spec.ParamValues, parameters)
+	if apierrors.IsNotFound(err) {
+		s.Build.Status.Reason = ptr.To[buildapi.BuildReason](buildapi.BuildStrategyNotFound)
+		s.Build.Status.Message = ptr.To(fmt.Sprintf("buildStrategy %s does not exist in namespace %s", strategyName, s.Build.Namespace))
+		return nil
+	}
 
-	// Check that the Build param is not a restricted shipwright one
-	s.validateParamsNamesDefinition()
-
-	return nil
+	return err
 }
 
-func (s Strategy) validateParamsNamesDefinition() {
-
-	undesiredParams := []string{}
-
-	for _, p := range s.Build.Spec.ParamValues {
-		if isReserved := resources.IsSystemReservedParameter(p.Name); isReserved {
-			undesiredParams = append(undesiredParams, p.Name)
-		}
+func (s Strategy) validateClusterBuildStrategy(ctx context.Context, strategyName string) error {
+	clusterBuildStrategy := &buildapi.ClusterBuildStrategy{}
+	err := s.Client.Get(ctx, types.NamespacedName{Name: strategyName}, clusterBuildStrategy)
+	if err == nil {
+		s.validateBuildParams(clusterBuildStrategy.GetParameters())
+		s.validateBuildVolumes(clusterBuildStrategy.GetVolumes())
+		s.validateStepResources(clusterBuildStrategy.GetBuildSteps())
+		return nil
 	}
 
-	if len(undesiredParams) > 0 {
-		s.Build.Status.Reason = build.RestrictedParametersInUse
-		s.Build.Status.Message = fmt.Sprintf("restricted parameters in use: %s", strings.Join(undesiredParams, ","))
+	if apierrors.IsNotFound(err) {
+		s.Build.Status.Reason = ptr.To[buildapi.BuildReason](buildapi.ClusterBuildStrategyNotFound)
+		s.Build.Status.Message = ptr.To(fmt.Sprintf("clusterBuildStrategy %s does not exist", strategyName))
+		return nil
+	}
+
+	return err
+}
+
+func (s Strategy) validateBuildParams(parameterDefinitions []buildapi.Parameter) {
+	valid, reason, message := BuildParameters(parameterDefinitions, s.Build.Spec.ParamValues)
+	if !valid {
+		s.Build.Status.Reason = ptr.To[buildapi.BuildReason](reason)
+		s.Build.Status.Message = ptr.To(message)
 	}
 }
 
-func (s Strategy) validateParamsInStrategies(params []build.ParamValue, parameters []build.Parameter) {
-
-	undefinedParams := []string{}
-	definedParameter := false
-	for _, bp := range params {
-		for _, sp := range parameters {
-			if bp.Name == sp.Name {
-				definedParameter = true
-			}
-		}
-		if !definedParameter {
-			undefinedParams = append(undefinedParams, bp.Name)
-		}
-		definedParameter = false
+func (s Strategy) validateBuildVolumes(strategyVolumes []buildapi.BuildStrategyVolume) {
+	valid, reason, message := BuildVolumes(strategyVolumes, s.Build.Spec.Volumes)
+	if !valid {
+		s.Build.Status.Reason = ptr.To[buildapi.BuildReason](reason)
+		s.Build.Status.Message = ptr.To(message)
 	}
+}
 
-	if len(undefinedParams) > 0 {
-		s.Build.Status.Reason = build.UndefinedParameter
-		s.Build.Status.Message = fmt.Sprintf("parameter not defined in the strategies: %s", strings.Join(undefinedParams, ","))
+// validateStepResources validates that all step resource overrides reference steps
+// that exist in the build strategy.
+func (s Strategy) validateStepResources(strategySteps []buildapi.Step) {
+	valid, reason, message := BuildStepResources(strategySteps, s.Build.Spec.Strategy.StepResources)
+	if !valid {
+		s.Build.Status.Reason = ptr.To[buildapi.BuildReason](reason)
+		s.Build.Status.Message = ptr.To(message)
 	}
 }

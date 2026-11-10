@@ -8,14 +8,15 @@ import (
 	"context"
 	"fmt"
 
-	buildv1alpha1 "github.com/shipwright-io/build/pkg/apis/build/v1alpha1"
-	"github.com/shipwright-io/build/pkg/ctxlog"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	buildapi "github.com/shipwright-io/build/pkg/apis/build/v1beta1"
+	"github.com/shipwright-io/build/pkg/ctxlog"
 )
 
 const (
@@ -30,17 +31,17 @@ const (
 )
 
 // GetGeneratedServiceAccountName returns the name of the generated service account for a build run
-func GetGeneratedServiceAccountName(buildRun *buildv1alpha1.BuildRun) string {
-	return buildRun.Name + "-sa"
+func GetGeneratedServiceAccountName(buildRun *buildapi.BuildRun) string {
+	return buildRun.Name
 }
 
 // IsGeneratedServiceAccountUsed checks if a build run uses a generated service account
-func IsGeneratedServiceAccountUsed(buildRun *buildv1alpha1.BuildRun) bool {
-	return buildRun.Spec.ServiceAccount != nil && buildRun.Spec.ServiceAccount.Generate
+func IsGeneratedServiceAccountUsed(buildRun *buildapi.BuildRun) bool {
+	return buildRun.Spec.ServiceAccount != nil && *buildRun.Spec.ServiceAccount == ".generate"
 }
 
 // GenerateSA generates a new service account on the fly
-func GenerateSA(ctx context.Context, client client.Client, build *buildv1alpha1.Build, buildRun *buildv1alpha1.BuildRun) (serviceAccount *corev1.ServiceAccount, err error) {
+func GenerateSA(ctx context.Context, client client.Client, build *buildapi.Build, buildRun *buildapi.BuildRun) (serviceAccount *corev1.ServiceAccount, err error) {
 	serviceAccount = &corev1.ServiceAccount{}
 	err = client.Get(
 		ctx,
@@ -60,12 +61,12 @@ func GenerateSA(ctx context.Context, client client.Client, build *buildv1alpha1.
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      GetGeneratedServiceAccountName(buildRun),
 				Namespace: buildRun.Namespace,
-				Labels:    map[string]string{buildv1alpha1.LabelBuildRun: buildRun.Name},
+				Labels:    map[string]string{buildapi.LabelBuildRun: buildRun.Name},
 				OwnerReferences: []metav1.OwnerReference{
-					*metav1.NewControllerRef(buildRun, buildv1alpha1.SchemeGroupVersion.WithKind("BuildRun")),
+					*metav1.NewControllerRef(buildRun, buildapi.SchemeGroupVersion.WithKind("BuildRun")),
 				},
 			},
-			AutomountServiceAccountToken: pointer.BoolPtr(false),
+			AutomountServiceAccountToken: ptr.To(false),
 		}
 		ctxlog.Debug(ctx, "automatic generation of service account", namespace, serviceAccount.Namespace, name, serviceAccount.Name)
 
@@ -85,9 +86,27 @@ func GenerateSA(ctx context.Context, client client.Client, build *buildv1alpha1.
 	}
 }
 
+// DeleteServiceAccount deletes the service account of a completed BuildRun if the service account
+// was generated
+func DeleteServiceAccount(ctx context.Context, client client.Client, completedBuildRun *buildapi.BuildRun) error {
+	if !IsGeneratedServiceAccountUsed(completedBuildRun) {
+		return nil
+	}
+	serviceAccount := &corev1.ServiceAccount{}
+	serviceAccount.Name = GetGeneratedServiceAccountName(completedBuildRun)
+	serviceAccount.Namespace = completedBuildRun.Namespace
+
+	ctxlog.Info(ctx, "deleting service account", namespace, completedBuildRun.Namespace, name, completedBuildRun.Name, "serviceAccount", serviceAccount.Name)
+	if err := client.Delete(ctx, serviceAccount); err != nil && !apierrors.IsNotFound(err) {
+		return err
+	}
+
+	return nil
+}
+
 // getDefaultNamespaceSA retrieves a pipeline or default sa per namespace. This is used when users do not specify a service account
 // to use on BuildRuns
-func getDefaultNamespaceSA(ctx context.Context, client client.Client, buildRun *buildv1alpha1.BuildRun) (*corev1.ServiceAccount, error) {
+func getDefaultNamespaceSA(ctx context.Context, client client.Client, buildRun *buildapi.BuildRun) (*corev1.ServiceAccount, error) {
 	// Note: If the default SA is not in the namespace, the controller will be always reconciling until if finds it or until the
 	// BuildRun gets deleted
 	serviceAccount := &corev1.ServiceAccount{}
@@ -108,32 +127,25 @@ func getDefaultNamespaceSA(ctx context.Context, client client.Client, buildRun *
 // RetrieveServiceAccount provides either a default sa with a referenced secret or it will generate a new sa on the fly.
 // When not using the generate feature, it will modify and return the default sa from a k8s namespace, which is "default"
 // or the default sa inside an openshift namespace, which is "pipeline".
-func RetrieveServiceAccount(ctx context.Context, client client.Client, build *buildv1alpha1.Build, buildRun *buildv1alpha1.BuildRun) (*corev1.ServiceAccount, error) {
-
-	var (
-		err error
-	)
-
+func RetrieveServiceAccount(ctx context.Context, client client.Client, build *buildapi.Build, buildRun *buildapi.BuildRun) (serviceAccount *corev1.ServiceAccount, err error) {
 	// generate or retrieve an existing autogenerated sa
 	if IsGeneratedServiceAccountUsed(buildRun) {
 		return GenerateSA(ctx, client, build, buildRun)
 	}
+	if buildRun.Spec.ServiceAccount != nil {
+		serviceAccountName := *buildRun.Spec.ServiceAccount
 
-	serviceAccount := &corev1.ServiceAccount{}
-
-	if buildRun.Spec.ServiceAccount != nil && buildRun.Spec.ServiceAccount.Name != nil {
-		serviceAccountName := *buildRun.Spec.ServiceAccount.Name
-		err := client.Get(ctx, types.NamespacedName{Name: serviceAccountName, Namespace: buildRun.Namespace}, serviceAccount)
 		// here we might need to update Status Conditions and Fail the BR
-		if err != nil {
+		serviceAccount = &corev1.ServiceAccount{}
+		if err = client.Get(ctx, types.NamespacedName{Name: serviceAccountName, Namespace: buildRun.Namespace}, serviceAccount); err != nil {
 			if apierrors.IsNotFound(err) {
 				if updateErr := UpdateConditionWithFalseStatus(ctx, client, buildRun, fmt.Sprintf("service account %s not found", serviceAccountName), ConditionServiceAccountNotFound); updateErr != nil {
 					return nil, HandleError("failed to retrieve service account", err, updateErr)
 				}
 			}
-
 			return nil, err
 		}
+
 	} else {
 		// we default to pipeline/default sa
 		serviceAccount, err = getDefaultNamespaceSA(ctx, client, buildRun)

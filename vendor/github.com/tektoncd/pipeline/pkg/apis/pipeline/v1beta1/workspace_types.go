@@ -60,7 +60,10 @@ type WorkspaceBinding struct {
 	SubPath string `json:"subPath,omitempty"`
 	// VolumeClaimTemplate is a template for a claim that will be created in the same namespace.
 	// The PipelineRun controller is responsible for creating a unique claim for each instance of PipelineRun.
+	// See PersistentVolumeClaim (API version: v1)
 	// +optional
+	// +kubebuilder:pruning:PreserveUnknownFields
+	// +kubebuilder:validation:Schemaless
 	VolumeClaimTemplate *corev1.PersistentVolumeClaim `json:"volumeClaimTemplate,omitempty"`
 	// PersistentVolumeClaimVolumeSource represents a reference to a
 	// PersistentVolumeClaim in the same namespace. Either this OR EmptyDir can be used.
@@ -77,10 +80,17 @@ type WorkspaceBinding struct {
 	// Secret represents a secret that should populate this workspace.
 	// +optional
 	Secret *corev1.SecretVolumeSource `json:"secret,omitempty"`
+	// Projected represents a projected volume that should populate this workspace.
+	// +optional
+	Projected *corev1.ProjectedVolumeSource `json:"projected,omitempty"`
+	// CSI (Container Storage Interface) represents ephemeral storage that is handled by certain external CSI drivers.
+	// +optional
+	CSI *corev1.CSIVolumeSource `json:"csi,omitempty"`
 }
 
 // WorkspacePipelineDeclaration creates a named slot in a Pipeline that a PipelineRun
 // is expected to populate with a workspace binding.
+//
 // Deprecated: use PipelineWorkspaceDeclaration type instead
 type WorkspacePipelineDeclaration = PipelineWorkspaceDeclaration
 
@@ -105,7 +115,8 @@ type WorkspacePipelineTaskBinding struct {
 	// Name is the name of the workspace as declared by the task
 	Name string `json:"name"`
 	// Workspace is the name of the workspace declared by the pipeline
-	Workspace string `json:"workspace"`
+	// +optional
+	Workspace string `json:"workspace,omitempty"`
 	// SubPath is optionally a directory on the volume which should be used
 	// for this binding (i.e. the volume will be mounted at this sub directory).
 	// +optional

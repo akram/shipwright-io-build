@@ -1,0 +1,134 @@
+// Copyright The Shipwright Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
+package resources
+
+import (
+	pipelineapi "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	buildapi "github.com/shipwright-io/build/pkg/apis/build/v1beta1"
+	"github.com/shipwright-io/build/pkg/config"
+)
+
+// TaskRunGenerator implements BuildRunExecutorGenerator for TaskRun execution.
+//
+// All build phases run as sequential steps within a single TaskSpec:
+//   - Source acquisition (git-clone)
+//   - Build strategy execution (buildah-build)
+//   - Output processing (image-push)
+//
+// Steps share the same Pod filesystem for efficient data transfer.
+type TaskRunGenerator struct {
+	cfg                *config.Config
+	build              *buildapi.Build
+	buildRun           *buildapi.BuildRun
+	serviceAccountName string
+	strategy           buildapi.BuilderStrategy
+
+	taskRun *pipelineapi.TaskRun
+}
+
+func NewTaskRunGenerator(
+	cfg *config.Config,
+	build *buildapi.Build,
+	buildRun *buildapi.BuildRun,
+	serviceAccountName string,
+	strategy buildapi.BuilderStrategy,
+) *TaskRunGenerator {
+	return &TaskRunGenerator{
+		cfg:                cfg,
+		build:              build,
+		buildRun:           buildRun,
+		serviceAccountName: serviceAccountName,
+		strategy:           strategy,
+	}
+}
+
+func (g *TaskRunGenerator) InitializeExecutor() error {
+	taskSpec := createBaseTaskSpec()
+
+	g.taskRun = &pipelineapi.TaskRun{
+		ObjectMeta: generateTaskRunMetadata(g.build, g.buildRun),
+		Spec: pipelineapi.TaskRunSpec{
+			ServiceAccountName: g.serviceAccountName,
+			TaskSpec:           taskSpec,
+			Workspaces:         generateWorkspaceBindings(),
+		},
+	}
+
+	return nil
+}
+
+func (g *TaskRunGenerator) GenerateSourceAcquisitionPhase(_ *executionContext) error {
+	applySourcesToTaskSpec(g.cfg, g.taskRun.Spec.TaskSpec, g.build, g.buildRun)
+	return nil
+}
+
+func (g *TaskRunGenerator) GenerateBuildStrategyPhase(execCtx *executionContext) error {
+	addStrategyParametersToTaskSpec(g.taskRun.Spec.TaskSpec, g.strategy.GetParameters())
+
+	volumeMounts, err := applyBuildStrategySteps(
+		g.taskRun.Spec.TaskSpec,
+		g.build,
+		g.buildRun,
+		g.strategy.GetBuildSteps(),
+		g.strategy.GetVolumes(),
+		execCtx.combinedEnvs,
+	)
+	if err != nil {
+		return err
+	}
+
+	execCtx.volumeMounts = volumeMounts
+
+	return generateTaskSpecVolumes(
+		g.taskRun.Spec.TaskSpec,
+		execCtx.volumeMounts,
+		execCtx.strategyVolumes,
+		execCtx.buildVolumes,
+		execCtx.buildRunVolumes,
+	)
+}
+
+func (g *TaskRunGenerator) GenerateOutputImagePhase(_ *executionContext) error {
+	buildRunOutput := g.buildRun.Spec.Output
+	if buildRunOutput == nil {
+		buildRunOutput = &buildapi.Image{}
+	}
+
+	return SetupImageProcessing(g.taskRun, g.cfg, g.buildRun.CreationTimestamp.Time, g.build.Spec.Output, *buildRunOutput)
+}
+
+func (g *TaskRunGenerator) ApplyInfrastructureConfiguration() error {
+	if err := applyNodeSelectors(g.taskRun, g.build, g.buildRun); err != nil {
+		return err
+	}
+
+	if err := applyTolerations(g.taskRun, g.build, g.buildRun); err != nil {
+		return err
+	}
+
+	if err := applyRuntimeClassName(g.taskRun, g.build, g.buildRun); err != nil {
+		return err
+	}
+
+	return applyScheduler(g.taskRun, g.build, g.buildRun)
+}
+
+func (g *TaskRunGenerator) ApplyMetadataConfiguration() error {
+	if err := applyAnnotationsAndLabels(g.taskRun, g.strategy); err != nil {
+		return err
+	}
+
+	if err := applyTimeout(g.taskRun, g.build, g.buildRun); err != nil {
+		return err
+	}
+
+	return applyParameters(g.taskRun, g.build, g.buildRun, g.strategy)
+}
+
+func (g *TaskRunGenerator) GetExecutor() client.Object {
+	return g.taskRun
+}

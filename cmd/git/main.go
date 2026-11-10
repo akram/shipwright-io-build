@@ -7,16 +7,19 @@ package main
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/spf13/pflag"
+
+	shpgit "github.com/shipwright-io/build/pkg/git"
+	"github.com/shipwright-io/build/pkg/util"
 )
 
 type credentialType int
@@ -27,12 +30,21 @@ const (
 	typeUsernamePassword
 )
 
+var (
+	useNoTagsFlag        = false
+	useRevisionFlag      = false
+	useDepthForSubmodule = false
+
+	displayURL string
+)
+
 // ExitError is an error which has an exit code to be used in os.Exit() to
 // return both an exit code and an error message
 type ExitError struct {
 	Code    int
 	Message string
 	Cause   error
+	Reason  shpgit.ErrorClass
 }
 
 func (e ExitError) Error() string {
@@ -40,23 +52,36 @@ func (e ExitError) Error() string {
 }
 
 type settings struct {
-	url                 string
-	revision            string
-	depth               uint
-	target              string
-	resultFileCommitSha string
-	secretPath          string
-	skipValidation      bool
+	help                      bool
+	url                       string
+	revision                  string
+	depth                     uint
+	target                    string
+	resultFileCommitSha       string
+	resultFileCommitAuthor    string
+	resultFileBranchName      string
+	resultFileSourceTimestamp string
+	secretPath                string
+	skipValidation            bool
+	gitURLRewrite             bool
+	resultFileErrorMessage    string
+	resultFileErrorReason     string
+	verbose                   bool
+	showListing               bool
 }
 
 var flagValues settings
 
 var (
-	sshGitURLRegEx = regexp.MustCompile(`^(git@|ssh:\/\/).+$`)
-	commitShaRegEx = regexp.MustCompile(`^[0-9a-f]{7,40}$`)
+	sshGitURLRegEx     = regexp.MustCompile(`^(git@|ssh:\/\/).+$`)
+	fullCommitShaRegex = regexp.MustCompile(`^[0-9a-f]{40}$`)
+	commitShaRegEx     = regexp.MustCompile(`^[0-9a-f]{7,40}$`)
 )
 
 func init() {
+	// Explicitly define the help flag so that --help can be invoked and returns status code 0
+	pflag.BoolVar(&flagValues.help, "help", false, "Print the help")
+
 	// Main flags for the Git step to define the configuration, for example
 	// the flags for `url`, and `target` will always be used, but `revision`
 	// depends on the respective use case.
@@ -64,7 +89,14 @@ func init() {
 	pflag.StringVar(&flagValues.revision, "revision", "", "The revision of the Git repository to be cloned. Optional, defaults to the default branch.")
 	pflag.StringVar(&flagValues.target, "target", "", "The target directory of the clone operation")
 	pflag.StringVar(&flagValues.resultFileCommitSha, "result-file-commit-sha", "", "A file to write the commit sha to.")
+	pflag.StringVar(&flagValues.resultFileCommitAuthor, "result-file-commit-author", "", "A file to write the commit author to.")
+	pflag.StringVar(&flagValues.resultFileSourceTimestamp, "result-file-source-timestamp", "", "A file to write the source timestamp to.")
+	pflag.StringVar(&flagValues.resultFileBranchName, "result-file-branch-name", "", "A file to write the branch name to.")
 	pflag.StringVar(&flagValues.secretPath, "secret-path", "", "A directory that contains a secret. Either username and password for basic authentication. Or a SSH private key and optionally a known hosts file. Optional.")
+
+	// Flags with paths for writing error related information
+	pflag.StringVar(&flagValues.resultFileErrorMessage, "result-file-error-message", "", "A file to write the error message to.")
+	pflag.StringVar(&flagValues.resultFileErrorReason, "result-file-error-reason", "", "A file to write the error reason to.")
 
 	// Optional flag to be able to override the default shallow clone depth,
 	// which should be fine for almost all use cases we use the Git source step
@@ -73,6 +105,9 @@ func init() {
 
 	// Mostly internal flag
 	pflag.BoolVar(&flagValues.skipValidation, "skip-validation", false, "skip pre-requisite validation")
+	pflag.BoolVar(&flagValues.gitURLRewrite, "git-url-rewrite", false, "set Git config to use url-insteadOf setting based on Git repository URL")
+	pflag.BoolVar(&flagValues.verbose, "verbose", false, "Verbose logging")
+	pflag.BoolVar(&flagValues.showListing, "show-listing", false, "Print file listing of files cloned from the Git repository")
 }
 
 func main() {
@@ -81,6 +116,10 @@ func main() {
 		switch err := err.(type) {
 		case *ExitError:
 			exitcode = err.Code
+		}
+
+		if writeErr := writeErrorResults(shpgit.NewErrorResultFromMessage(err.Error())); writeErr != nil {
+			log.Printf("Could not write error results: %s", writeErr.Error())
 		}
 
 		log.Print(err.Error())
@@ -93,16 +132,33 @@ func Execute(ctx context.Context) error {
 	flagValues = settings{depth: 1}
 	pflag.Parse()
 
+	if val, ok := os.LookupEnv("GIT_SHOW_LISTING"); ok {
+		flagValues.showListing, _ = strconv.ParseBool(val)
+	}
+
+	if flagValues.help {
+		pflag.Usage()
+		return nil
+	}
+
 	// pre-req checks
 	if err := checkEnvironment(ctx); err != nil {
 		return err
 	}
 
-	if err := runGitClone(ctx); err != nil {
-		return err
-	}
+	// Check if Git CLI supports --no-tags and --revision for clone
+	out, _ := git(ctx, "clone", "-h")
+	useNoTagsFlag = strings.Contains(out, "--no-tags")
+	useRevisionFlag = strings.Contains(out, "--revision")
 
-	return nil
+	// Check if Git CLI support --single-branch and therefore shallow clones using --depth
+	out, _ = git(ctx, "submodule", "-h")
+	useDepthForSubmodule = strings.Contains(out, "single-branch")
+
+	// Create clean version of the URL that should be safe to be displayed in logs
+	displayURL = cleanURL()
+
+	return runGitClone(ctx)
 }
 
 func runGitClone(ctx context.Context) error {
@@ -114,8 +170,20 @@ func runGitClone(ctx context.Context) error {
 		return &ExitError{Code: 101, Message: "the 'target' argument must not be empty"}
 	}
 
+	// check the endpoint, if hostname extraction fails, ignore that failure
+	if hostname, port, err := shpgit.ExtractHostnamePort(flagValues.url); err == nil {
+		if !util.TestConnection(hostname, port, 9) {
+			log.Printf("Warning: a connection test to %s:%d failed. The operation will likely fail.\n", hostname, port)
+		}
+	}
+
 	if err := clone(ctx); err != nil {
 		return err
+	}
+
+	if flagValues.showListing {
+		// ignore any errors when walking through the file system, the listing is only for informational purposes
+		_ = util.ListFiles(log.Writer(), flagValues.target)
 	}
 
 	if flagValues.resultFileCommitSha != "" {
@@ -124,7 +192,44 @@ func runGitClone(ctx context.Context) error {
 			return err
 		}
 
-		if err := ioutil.WriteFile(flagValues.resultFileCommitSha, []byte(output), 0644); err != nil {
+		// #nosec G306 the file must be readable by build steps that potentially run as a different user
+		if err := os.WriteFile(flagValues.resultFileCommitSha, []byte(output), 0644); err != nil {
+			return err
+		}
+	}
+
+	if flagValues.resultFileCommitAuthor != "" {
+		output, err := git(ctx, "-C", flagValues.target, "log", "-1", "--pretty=format:%an")
+		if err != nil {
+			return err
+		}
+
+		// #nosec G306 the file must be readable by build steps that potentially run as a different user
+		if err = os.WriteFile(flagValues.resultFileCommitAuthor, []byte(output), 0644); err != nil {
+			return err
+		}
+	}
+
+	if flagValues.resultFileSourceTimestamp != "" {
+		output, err := git(ctx, "-C", flagValues.target, "show", "--no-patch", "--format=%ct")
+		if err != nil {
+			return err
+		}
+
+		// #nosec G306 the file must be readable by build steps that potentially run as a different user
+		if err = os.WriteFile(flagValues.resultFileSourceTimestamp, []byte(output), 0644); err != nil {
+			return err
+		}
+	}
+
+	if strings.TrimSpace(flagValues.revision) == "" && strings.TrimSpace(flagValues.resultFileBranchName) != "" {
+		output, err := git(ctx, "-C", flagValues.target, "rev-parse", "--abbrev-ref", "HEAD")
+		if err != nil {
+			return err
+		}
+
+		// #nosec G306 the file must be readable by build steps that potentially run as a different user
+		if err := os.WriteFile(flagValues.resultFileBranchName, []byte(output), 0644); err != nil {
 			return err
 		}
 	}
@@ -149,8 +254,13 @@ func checkEnvironment(ctx context.Context) error {
 			return &ExitError{Code: 120, Message: err.Error(), Cause: err}
 		}
 
+		if flagValues.verbose {
+			log.Printf("Debug: %s %s\n", path, check.versionArg)
+		}
+		// #nosec G204 in the default container configuration, it is impossible to inject other binaries, as such it is safe that we have no hard-coded path
 		out, err := exec.CommandContext(ctx, path, check.versionArg).CombinedOutput()
 		if err != nil {
+			log.Printf("Error: %s: %s\n", check.toolName, strings.TrimRight(string(out), "\n"))
 			return err
 		}
 
@@ -168,12 +278,24 @@ func clone(ctx context.Context) error {
 	cloneArgs := []string{
 		"clone",
 		"--quiet",
-		"--no-tags",
+	}
+
+	if useNoTagsFlag {
+		cloneArgs = append(cloneArgs, "--no-tags")
 	}
 
 	var commitSha string
 	switch {
+	case useRevisionFlag && fullCommitShaRegex.MatchString(flagValues.revision):
+		// we can pass the commit SHA directly to `git clone --revision` and can honor the depth.
+		cloneArgs = append(cloneArgs, "--revision", flagValues.revision)
+
+		if flagValues.depth > 0 {
+			cloneArgs = append(cloneArgs, "--depth", fmt.Sprintf("%d", flagValues.depth))
+		}
+
 	case commitShaRegEx.MatchString(flagValues.revision):
+		// for a short commit SHA or when --revision is not supported, we must do a full `git clone --no-checkout` and later a checkout. For this, we cannot honor depth.
 		commitSha = flagValues.revision
 		cloneArgs = append(cloneArgs, "--no-checkout")
 
@@ -189,7 +311,7 @@ func clone(ctx context.Context) error {
 		}
 	}
 
-	var addtlCredArgs []string
+	var addtlGitArgs []string
 	if flagValues.secretPath != "" {
 		credType, err := checkCredentials()
 		if err != nil {
@@ -202,19 +324,20 @@ func clone(ctx context.Context) error {
 			// permissions, it will end up failing due to SSH sanity checks.
 			// Therefore, create a temporary replacement with the right
 			// file permissions.
-			data, err := ioutil.ReadFile(filepath.Join(flagValues.secretPath, "ssh-privatekey"))
+			data, err := os.ReadFile(filepath.Join(flagValues.secretPath, "ssh-privatekey"))
 			if err != nil {
 				return err
 			}
 
-			sshPrivateKeyFile, err := ioutil.TempFile(os.TempDir(), "ssh-private-key")
+			sshPrivateKeyFile, err := os.CreateTemp(os.TempDir(), "ssh-private-key")
 			if err != nil {
 				return err
 			}
 
 			defer os.Remove(sshPrivateKeyFile.Name())
 
-			if err := ioutil.WriteFile(sshPrivateKeyFile.Name(), data, 0400); err != nil {
+			// #nosec G703 this is a simple file in the temporary directory, unclear why gosec sees a path traversal here
+			if err := os.WriteFile(sshPrivateKeyFile.Name(), data, 0400); err != nil {
 				return err
 			}
 
@@ -236,10 +359,42 @@ func clone(ctx context.Context) error {
 				)
 			}
 
-			addtlCredArgs = append(addtlCredArgs,
+			addtlGitArgs = append(addtlGitArgs,
 				"-c",
 				fmt.Sprintf(`core.sshCommand=%s`, strings.Join(sshCmd, " ")),
 			)
+
+			// When the Git URL rewrite is enabled, additional Git config
+			// options are required to introduce a rewrite rule so that
+			// HTTPS URLs are rewritten into Git+SSH URLs on the fly for
+			// the main clone as well as the submodule operations. This
+			// only makes sense in case a private key is configured.
+			if flagValues.gitURLRewrite {
+				var hostname string
+				switch {
+				case strings.HasPrefix(flagValues.url, "git@"):
+					trimmed := strings.TrimPrefix(flagValues.url, "git@")
+					splitted := strings.SplitN(trimmed, ":", 2)
+					hostname = splitted[0]
+
+				case strings.HasPrefix(flagValues.url, "http"):
+					repoURL, err := url.Parse(flagValues.url)
+					if err != nil {
+						return err
+					}
+					hostname = repoURL.Host
+
+				default:
+					log.Printf("Failed to setup Git URL rewrite, unknown/unsupported URL type: %q\n", flagValues.url)
+				}
+
+				if hostname != "" {
+					addtlGitArgs = append(addtlGitArgs,
+						"-c",
+						fmt.Sprintf("url.ssh://git@%s/.insteadOf=https://%s/", hostname, hostname),
+					)
+				}
+			}
 
 		case typeUsernamePassword:
 			repoURL, err := url.Parse(flagValues.url)
@@ -247,36 +402,38 @@ func clone(ctx context.Context) error {
 				return err
 			}
 
-			username, err := ioutil.ReadFile(filepath.Join(flagValues.secretPath, "username"))
+			username, err := os.ReadFile(filepath.Join(flagValues.secretPath, "username"))
 			if err != nil {
 				return err
 			}
 
-			password, err := ioutil.ReadFile(filepath.Join(flagValues.secretPath, "password"))
+			password, err := os.ReadFile(filepath.Join(flagValues.secretPath, "password"))
 			if err != nil {
 				return err
 			}
 
 			repoURL.User = url.UserPassword(string(username), string(password))
 
-			credHelperFile, err := ioutil.TempFile(os.TempDir(), "cred-helper-file")
+			credHelperFile, err := os.CreateTemp(os.TempDir(), "cred-helper-file")
 			if err != nil {
 				return err
 			}
 
 			defer os.Remove(credHelperFile.Name())
 
-			if err := ioutil.WriteFile(credHelperFile.Name(), []byte(repoURL.String()), 0400); err != nil {
+			// #nosec G703 this is a simple file in the temporary directory, unclear why gosec sees a path traversal here
+			if err := os.WriteFile(credHelperFile.Name(), []byte(repoURL.String()), 0400); err != nil {
 				return err
 			}
 
-			if _, err := git(ctx, "config", "--global", "credential.helper", fmt.Sprintf("store --file %s", credHelperFile.Name())); err != nil {
-				return err
-			}
+			addtlGitArgs = append(addtlGitArgs,
+				"-c",
+				fmt.Sprintf("credential.helper=%s", fmt.Sprintf("store --file %s", credHelperFile.Name())),
+			)
 		}
 	}
 
-	cloneArgs = append(cloneArgs, addtlCredArgs...)
+	cloneArgs = append(cloneArgs, addtlGitArgs...)
 	cloneArgs = append(cloneArgs, "--", flagValues.url, flagValues.target)
 	if _, err := git(ctx, cloneArgs...); err != nil {
 		return err
@@ -289,9 +446,9 @@ func clone(ctx context.Context) error {
 	}
 
 	submoduleArgs := []string{"-C", flagValues.target}
-	submoduleArgs = append(submoduleArgs, addtlCredArgs...)
+	submoduleArgs = append(submoduleArgs, addtlGitArgs...)
 	submoduleArgs = append(submoduleArgs, "submodule", "update", "--init", "--recursive")
-	if flagValues.depth > 0 {
+	if useDepthForSubmodule && flagValues.depth > 0 {
 		submoduleArgs = append(submoduleArgs, "--depth", fmt.Sprintf("%d", flagValues.depth))
 	}
 
@@ -311,7 +468,7 @@ func clone(ctx context.Context) error {
 	}
 
 	log.Printf("Successfully loaded %s (%s) into %s\n",
-		flagValues.url,
+		displayURL,
 		revision,
 		flagValues.target,
 	)
@@ -320,11 +477,23 @@ func clone(ctx context.Context) error {
 }
 
 func git(ctx context.Context, args ...string) (string, error) {
-	cmd := exec.CommandContext(ctx, "git", args...)
-	log.Print(cmd.String())
+	fullArgs := []string{
+		"-c",
+		fmt.Sprintf("safe.directory=%s", flagValues.target),
+	}
+	fullArgs = append(fullArgs, args...)
+	// #nosec G204 arguments are well-defined by the code
+	// #nosec G702 arguments are well-defined by the code
+	cmd := exec.CommandContext(ctx, "git", fullArgs...)
+
+	// Print the command to be executed, but replace the URL with a safe version
+	// #nosec G706
+	log.Print(strings.ReplaceAll(cmd.String(), flagValues.url, displayURL))
 
 	// Make sure that the spawned process does not try to prompt for infos
-	os.Setenv("GIT_TERMINAL_PROMPT", "0")
+	if err := os.Setenv("GIT_TERMINAL_PROMPT", "0"); err != nil {
+		return "", err
+	}
 	cmd.Stdin = nil
 
 	out, err := cmd.CombinedOutput()
@@ -362,30 +531,95 @@ func checkCredentials() (credentialType, error) {
 	// in which case there is a file called ssh-privatekey
 	hasPrivateKey := hasFile(flagValues.secretPath, "ssh-privatekey")
 	isSSHGitURL := sshGitURLRegEx.MatchString(flagValues.url)
+	isGitURLRewriteSet := flagValues.gitURLRewrite
 	switch {
 	case hasPrivateKey && isSSHGitURL:
 		return typePrivateKey, nil
 
+	case hasPrivateKey && !isSSHGitURL && isGitURLRewriteSet:
+		return typePrivateKey, nil
+
 	case hasPrivateKey && !isSSHGitURL:
-		return typeUndef, &ExitError{Code: 110, Message: "Credential/URL inconsistency: SSH credentials provided, but URL is not a SSH Git URL"}
+		return typeUndef, &ExitError{
+			Code:    110,
+			Message: shpgit.AuthUnexpectedSSH.ToMessage(),
+			Reason:  shpgit.AuthUnexpectedSSH,
+		}
 
 	case !hasPrivateKey && isSSHGitURL:
-		return typeUndef, &ExitError{Code: 110, Message: "Credential/URL inconsistency: No SSH credentials provided, but URL is a SSH Git URL"}
+		return typeUndef, &ExitError{
+			Code:    110,
+			Message: shpgit.AuthExpectedSSH.ToMessage(),
+			Reason:  shpgit.AuthExpectedSSH,
+		}
 	}
 
 	// Checking whether mounted secret is of type `kubernetes.io/basic-auth`
 	// in which case there need to be the files username and password
 	hasUsername := hasFile(flagValues.secretPath, "username")
 	hasPassword := hasFile(flagValues.secretPath, "password")
-	isHTTPSURL := strings.HasPrefix(flagValues.url, "https")
 	switch {
-	case hasUsername && hasPassword && isHTTPSURL:
+	case hasUsername && hasPassword && strings.HasPrefix(flagValues.url, "https://"):
 		return typeUsernamePassword, nil
 
-	case hasUsername && !hasPassword || !hasUsername && hasPassword:
-		return typeUndef, &ExitError{Code: 110, Message: "Basic Auth incomplete: Both username and password need to be configured"}
+	case hasUsername && hasPassword && strings.HasPrefix(flagValues.url, "http://"):
+		return typeUndef, &ExitError{
+			Code:    110,
+			Message: shpgit.AuthUnexpectedHTTP.ToMessage(),
+			Reason:  shpgit.AuthUnexpectedHTTP,
+		}
 
+	case hasUsername && !hasPassword || !hasUsername && hasPassword:
+		return typeUndef, &ExitError{
+			Code:    110,
+			Message: shpgit.AuthBasicIncomplete.ToMessage(),
+			Reason:  shpgit.AuthBasicIncomplete,
+		}
 	}
 
-	return typeUndef, &ExitError{Code: 110, Message: "Unsupported type of credentials provided, either SSH private key or username/password is supported"}
+	return typeUndef, &ExitError{
+		Code:    110,
+		Message: "Unsupported type of credentials provided, either SSH private key or username/password is supported",
+		Reason:  shpgit.Unknown,
+	}
+}
+
+func writeErrorResults(failure *shpgit.ErrorResult) (err error) {
+	if flagValues.resultFileErrorReason == "" || flagValues.resultFileErrorMessage == "" {
+		return nil
+	}
+
+	messageToWrite := failure.Message
+	messageLengthThreshold := 300
+
+	if len(messageToWrite) > messageLengthThreshold {
+		messageToWrite = messageToWrite[:messageLengthThreshold-3] + "..."
+	}
+
+	// #nosec G306 the file must be readable by build steps that potentially run as a different user
+	if err = os.WriteFile(flagValues.resultFileErrorMessage, []byte(strings.TrimSpace(messageToWrite)), 0666); err != nil {
+		return err
+	}
+
+	// #nosec G306 the file must be readable by build steps that potentially run as a different user
+	return os.WriteFile(flagValues.resultFileErrorReason, []byte(failure.Reason.String()), 0666)
+}
+
+func cleanURL() string {
+	// non HTTP/HTTPS URLs are returned as-is (i.e. Git+SSH URLs)
+	if !strings.HasPrefix(flagValues.url, "http") {
+		return flagValues.url
+	}
+
+	// return redacted version of the URL if it is a parsable URL
+	if repoURL, err := url.Parse(flagValues.url); err == nil {
+		if repoURL.User != nil {
+			log.Println("URL has inline credentials, which need to be redacted for log out. If possible, use an alternative approach.")
+		}
+
+		return repoURL.Redacted()
+	}
+
+	// in any case, as a fallback, return it as-is
+	return flagValues.url
 }

@@ -1,0 +1,73 @@
+// Copyright The Shipwright Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
+package validate
+
+import (
+	"context"
+	"fmt"
+
+	corev1 "k8s.io/api/core/v1"
+	kerrors "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/utils/ptr"
+
+	buildapi "github.com/shipwright-io/build/pkg/apis/build/v1beta1"
+	"github.com/shipwright-io/build/pkg/env"
+)
+
+// Env implements the Env interface to add validations for the `buildapi.spec.env` slice.
+type Env struct {
+	Build *buildapi.Build
+}
+
+// ValidatePath executes the validation routine, inspecting the `buildapi.spec.env` path, which
+// contains a slice of corev1.EnvVar.
+func (e *Env) ValidatePath(_ context.Context) error {
+	if e.Build.Spec.Env == nil {
+		return nil
+	}
+
+	var allErrs []error
+	for _, envVar := range e.Build.Spec.Env {
+		if errs := e.validate(envVar); len(errs) != 0 {
+			allErrs = append(allErrs, errs...)
+		}
+	}
+
+	if len(allErrs) != 0 {
+		return fmt.Errorf("%s", kerrors.NewAggregate(allErrs).Error())
+	}
+
+	return nil
+}
+
+// validate inspects each environment variable and validates all required attributes.
+func (e *Env) validate(envVar corev1.EnvVar) []error {
+	var allErrs []error
+
+	if envVar.Name == "" {
+		e.Build.Status.Reason = ptr.To[buildapi.BuildReason](buildapi.SpecEnvNameCanNotBeBlank)
+		e.Build.Status.Message = ptr.To("name for environment variable must not be blank")
+		allErrs = append(allErrs, fmt.Errorf("%s", *e.Build.Status.Message))
+	}
+
+	if env.IsForbiddenEnvVar(envVar.Name) {
+		e.Build.Status.Reason = ptr.To[buildapi.BuildReason](buildapi.SpecEnvNameForbidden)
+		e.Build.Status.Message = ptr.To(fmt.Sprintf("environment variable %q is forbidden for security reasons", envVar.Name))
+		allErrs = append(allErrs, fmt.Errorf("%s", *e.Build.Status.Message))
+	}
+
+	if envVar.Value != "" && envVar.ValueFrom != nil {
+		e.Build.Status.Reason = ptr.To[buildapi.BuildReason](buildapi.SpecEnvOnlyOneOfValueOrValueFromMustBeSpecified)
+		e.Build.Status.Message = ptr.To("only one of value or valueFrom must be specified")
+		allErrs = append(allErrs, fmt.Errorf("%s", *e.Build.Status.Message))
+	}
+
+	return allErrs
+}
+
+// NewEnv instantiates a new Env passing the build object pointer along.
+func NewEnv(b *buildapi.Build) *Env {
+	return &Env{Build: b}
+}

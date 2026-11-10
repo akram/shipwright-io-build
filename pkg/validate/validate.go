@@ -8,9 +8,12 @@ import (
 	"context"
 	"fmt"
 
-	build "github.com/shipwright-io/build/pkg/apis/build/v1alpha1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	buildapi "github.com/shipwright-io/build/pkg/apis/build/v1beta1"
+	"github.com/shipwright-io/build/pkg/env"
+	"github.com/shipwright-io/build/pkg/reconciler/buildrun/resources"
 )
 
 const (
@@ -21,14 +24,31 @@ const (
 	// SourceURL for validating the source URL in Build objects
 	SourceURL = "sourceurl"
 	// Sources for validating `spec.sources` entries
-	Sources = "sources"
+	Source = "source"
+	// Output for validating `spec.output` entry
+	Output = "output"
 	// BuildName for validating `metadata.name` entry
 	BuildName = "buildname"
+	// Envs for validating `spec.env` entries
+	Envs = "env"
 	// OwnerReferences for validating the ownerreferences between a Build
 	// and BuildRun objects
 	OwnerReferences = "ownerreferences"
-	namespace       = "namespace"
-	name            = "name"
+	// Triggers for validating the `.spec.triggers` entries
+	Triggers = "triggers"
+	// NodeSelector for validating `spec.nodeSelector` entry
+	NodeSelector = "nodeselector"
+	// Tolerations for validating `spec.tolerations` entry
+	Tolerations = "tolerations"
+	// SchedulerName for validating `spec.schedulerName` entry
+	SchedulerName = "schedulername"
+	// RuntimeClassName for validating `spec.runtimeClassName` entry
+	RuntimeClassName = "runtimeclassname"
+)
+
+const (
+	namespace = "namespace"
+	name      = "name"
 )
 
 // BuildPath is an interface that holds a ValidatePath() function
@@ -41,7 +61,7 @@ type BuildPath interface {
 // BuildPath interface
 func NewValidation(
 	validationType string,
-	build *build.Build,
+	build *buildapi.Build,
 	client client.Client,
 	scheme *runtime.Scheme,
 ) (BuildPath, error) {
@@ -54,11 +74,111 @@ func NewValidation(
 		return &SourceURLRef{Build: build, Client: client}, nil
 	case OwnerReferences:
 		return &OwnerRef{Build: build, Client: client, Scheme: scheme}, nil
-	case Sources:
-		return &SourcesRef{Build: build}, nil
+	case Source:
+		return &SourceRef{Build: build}, nil
+	case Output:
+		return &BuildSpecOutputValidator{Build: build}, nil
 	case BuildName:
 		return &BuildNameRef{Build: build}, nil
+	case Envs:
+		return &Env{Build: build}, nil
+	case Triggers:
+		return &Trigger{build: build}, nil
+	case NodeSelector:
+		return &NodeSelectorRef{Build: build}, nil
+	case Tolerations:
+		return &TolerationsRef{Build: build}, nil
+	case SchedulerName:
+		return &SchedulerNameRef{Build: build}, nil
+	case RuntimeClassName:
+		return &RuntimeClassNameRef{Build: build}, nil
 	default:
 		return nil, fmt.Errorf("unknown validation type")
 	}
+}
+
+// All runs all given validations and exists at the first technical error
+func All(ctx context.Context, validations ...BuildPath) error {
+	for _, validatation := range validations {
+		if err := validatation.ValidatePath(ctx); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// BuildRunFields runs field validations against a BuildRun to detect
+// disallowed field combinations and issues
+func BuildRunFields(buildRun *buildapi.BuildRun) (string, string) {
+	if buildRun.Spec.Build.Spec == nil && buildRun.Spec.Build.Name == nil {
+		return resources.BuildRunNoRefOrSpec,
+			"no build referenced or specified, either 'buildRef' or 'buildSpec' has to be set"
+	}
+
+	if buildRun.Spec.Build.Spec != nil {
+		if buildRun.Spec.Build.Name != nil {
+			return resources.BuildRunAmbiguousBuild,
+				"fields 'buildRef' and 'buildSpec' are mutually exclusive"
+		}
+
+		if buildRun.Spec.Output != nil {
+			return resources.BuildRunBuildFieldOverrideForbidden,
+				"cannot use 'output' override and 'buildSpec' simultaneously"
+		}
+
+		if len(buildRun.Spec.ParamValues) > 0 {
+			return resources.BuildRunBuildFieldOverrideForbidden,
+				"cannot use 'paramValues' override and 'buildSpec' simultaneously"
+		}
+
+		if len(buildRun.Spec.Env) > 0 {
+			return resources.BuildRunBuildFieldOverrideForbidden,
+				"cannot use 'env' override and 'buildSpec' simultaneously"
+		}
+
+		if buildRun.Spec.Timeout != nil {
+			return resources.BuildRunBuildFieldOverrideForbidden,
+				"cannot use 'timeout' override and 'buildSpec' simultaneously"
+		}
+
+		if buildRun.Spec.Build.Spec.Trigger != nil {
+			return resources.BuildRunBuildFieldOverrideForbidden,
+				"cannot use 'triggers' override in the 'BuildRun', only allowed in the 'Build'"
+		}
+
+		if len(buildRun.Spec.NodeSelector) > 0 {
+			return resources.BuildRunBuildFieldOverrideForbidden,
+				"cannot use 'nodeSelector' override and 'buildSpec' simultaneously"
+		}
+
+		if len(buildRun.Spec.Tolerations) > 0 {
+			return resources.BuildRunBuildFieldOverrideForbidden,
+				"cannot use 'tolerations' override and 'buildSpec' simultaneously"
+		}
+
+		if buildRun.Spec.SchedulerName != nil {
+			return resources.BuildRunBuildFieldOverrideForbidden,
+				"cannot use 'schedulerName' override and 'buildSpec' simultaneously"
+		}
+
+		if buildRun.Spec.RuntimeClassName != nil {
+			return resources.BuildRunBuildFieldOverrideForbidden,
+				"cannot use 'runtimeClassName' override and 'buildSpec' simultaneously"
+		}
+
+		if len(buildRun.Spec.StepResources) > 0 {
+			return resources.BuildRunBuildFieldOverrideForbidden,
+				"cannot use 'stepResources' override and 'buildSpec' simultaneously"
+		}
+	}
+
+	for _, envVar := range buildRun.Spec.Env {
+		if env.IsForbiddenEnvVar(envVar.Name) {
+			return string(buildapi.SpecEnvNameForbidden),
+				fmt.Sprintf("environment variable %q is forbidden for security reasons", envVar.Name)
+		}
+	}
+
+	return "", ""
 }

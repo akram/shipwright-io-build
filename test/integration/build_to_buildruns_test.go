@@ -5,33 +5,25 @@
 package integration_test
 
 import (
-	"fmt"
 	"strings"
+	"time"
 
-	corev1 "k8s.io/api/core/v1"
-
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 
-	"github.com/shipwright-io/build/pkg/apis/build/v1alpha1"
-	"github.com/shipwright-io/build/test"
-)
-
-const (
-	BUILD    = "build-"
-	BUILDRUN = "buildrun-"
-	STRATEGY = "strategy-"
+	buildapi "github.com/shipwright-io/build/pkg/apis/build/v1beta1"
+	"github.com/shipwright-io/build/pkg/reconciler/buildrun/resources"
+	test "github.com/shipwright-io/build/test/v1beta1_samples"
 )
 
 var _ = Describe("Integration tests Build and BuildRuns", func() {
 
 	var (
-		cbsObject      *v1alpha1.ClusterBuildStrategy
-		buildObject    *v1alpha1.Build
-		buildRunObject *v1alpha1.BuildRun
+		cbsObject      *buildapi.ClusterBuildStrategy
+		buildObject    *buildapi.Build
+		buildRunObject *buildapi.BuildRun
 		buildSample    []byte
 		buildRunSample []byte
 	)
@@ -45,6 +37,7 @@ var _ = Describe("Integration tests Build and BuildRuns", func() {
 		Expect(err).To(BeNil())
 
 	})
+
 	// Delete the ClusterBuildStrategies after each test case
 	AfterEach(func() {
 
@@ -79,7 +72,16 @@ var _ = Describe("Integration tests Build and BuildRuns", func() {
 		})
 
 		It("should fail the builRun with a Reason", func() {
+			// use a custom strategy here that just sleeps 30 seconds, the default strategy fails on its own about
+			// as fast as the 5s timeout, and whichever comes first decides the BuildRun reason
+			sleepStrategy, err := tb.Catalog.LoadCBSWithName(STRATEGY+tb.Namespace+"custom", []byte(test.ClusterBuildStrategySleep30s))
+			Expect(err).To(BeNil())
+			Expect(tb.CreateClusterBuildStrategy(sleepStrategy)).To(BeNil())
+			DeferCleanup(func() {
+				Expect(tb.DeleteClusterBuildStrategy(sleepStrategy.Name)).To(BeNil())
+			})
 
+			buildObject.Spec.Strategy.Name = sleepStrategy.Name
 			Expect(tb.CreateBuild(buildObject)).To(BeNil())
 
 			buildObject, err = tb.GetBuildTillValidation(buildObject.Name)
@@ -89,9 +91,9 @@ var _ = Describe("Integration tests Build and BuildRuns", func() {
 
 			br, err := tb.GetBRTillCompletion(buildRunObject.Name)
 			Expect(err).To(BeNil())
-			Expect(br.Status.GetCondition(v1alpha1.Succeeded).Status).To(Equal(corev1.ConditionFalse))
-			Expect(br.Status.GetCondition(v1alpha1.Succeeded).Reason).To(Equal("BuildRunTimeout"))
-			Expect(br.Status.GetCondition(v1alpha1.Succeeded).Message).To(ContainSubstring("failed to finish within"))
+			Expect(br.Status.GetCondition(buildapi.Succeeded).Status).To(Equal(corev1.ConditionFalse))
+			Expect(br.Status.GetCondition(buildapi.Succeeded).Reason).To(Equal("BuildRunTimeout"))
+			Expect(br.Status.GetCondition(buildapi.Succeeded).Message).To(ContainSubstring("failed to finish within"))
 		})
 	})
 
@@ -113,9 +115,9 @@ var _ = Describe("Integration tests Build and BuildRuns", func() {
 
 			br, err := tb.GetBRTillCompletion(buildRunObject.Name)
 			Expect(err).To(BeNil())
-			Expect(br.Status.GetCondition(v1alpha1.Succeeded).Status).To(Equal(corev1.ConditionFalse))
-			Expect(br.Status.GetCondition(v1alpha1.Succeeded).Reason).To(Equal("BuildRunTimeout"))
-			Expect(br.Status.GetCondition(v1alpha1.Succeeded).Message).To(ContainSubstring("failed to finish within"))
+			Expect(br.Status.GetCondition(buildapi.Succeeded).Status).To(Equal(corev1.ConditionFalse))
+			Expect(br.Status.GetCondition(buildapi.Succeeded).Reason).To(Equal("BuildRunTimeout"))
+			Expect(br.Status.GetCondition(buildapi.Succeeded).Message).To(ContainSubstring("failed to finish within"))
 		})
 
 		It("should be able to override the build output", func() {
@@ -199,9 +201,9 @@ var _ = Describe("Integration tests Build and BuildRuns", func() {
 			br, err := tb.GetBR(buildRunObject.Name)
 			Expect(err).To(BeNil())
 			Expect(br.Status.CompletionTime).To(BeNil())
-			Expect(br.Status.GetCondition(v1alpha1.Succeeded).Type).To(Equal(v1alpha1.Succeeded))
-			Expect(br.Status.GetCondition(v1alpha1.Succeeded).Status).To(Equal(corev1.ConditionUnknown))
-			Expect(br.Status.GetCondition(v1alpha1.Succeeded).Reason).To(
+			Expect(br.Status.GetCondition(buildapi.Succeeded).Type).To(Equal(buildapi.Succeeded))
+			Expect(br.Status.GetCondition(buildapi.Succeeded).Status).To(Equal(corev1.ConditionUnknown))
+			Expect(br.Status.GetCondition(buildapi.Succeeded).Reason).To(
 				// BuildRun reason can be ExceededNodeResources
 				// if the Tekton TaskRun Pod is queued due to
 				// insufficient cluster resources.
@@ -231,9 +233,9 @@ var _ = Describe("Integration tests Build and BuildRuns", func() {
 			br, err := tb.GetBR(buildRunObject.Name)
 			Expect(err).To(BeNil())
 			Expect(br.Status.StartTime).To(BeNil())
-			Expect(br.Status.GetCondition(v1alpha1.Succeeded).Status).To(Equal(corev1.ConditionFalse))
-			Expect(br.Status.GetCondition(v1alpha1.Succeeded).Reason).To(Equal("BuildNotFound"))
-			Expect(br.Status.GetCondition(v1alpha1.Succeeded).Message).To(ContainSubstring("not found"))
+			Expect(br.Status.GetCondition(buildapi.Succeeded).Status).To(Equal(corev1.ConditionFalse))
+			Expect(br.Status.GetCondition(buildapi.Succeeded).Reason).To(Equal("BuildNotFound"))
+			Expect(br.Status.GetCondition(buildapi.Succeeded).Message).To(ContainSubstring("not found"))
 
 		})
 	})
@@ -257,9 +259,9 @@ var _ = Describe("Integration tests Build and BuildRuns", func() {
 			br, err := tb.GetBRTillCompletion(buildRunObject.Name)
 			Expect(err).To(BeNil())
 
-			Expect(br.Status.GetCondition(v1alpha1.Succeeded).Status).To(Equal(corev1.ConditionFalse))
-			Expect(br.Status.GetCondition(v1alpha1.Succeeded).Reason).To(Equal("BuildRegistrationFailed"))
-			Expect(br.Status.GetCondition(v1alpha1.Succeeded).Message).To(ContainSubstring("Build is not registered correctly"))
+			Expect(br.Status.GetCondition(buildapi.Succeeded).Status).To(Equal(corev1.ConditionFalse))
+			Expect(br.Status.GetCondition(buildapi.Succeeded).Reason).To(Equal(resources.ConditionBuildRegistrationFailed))
+			Expect(br.Status.GetCondition(buildapi.Succeeded).Message).To(ContainSubstring("Build is not registered correctly"))
 		})
 	})
 
@@ -289,9 +291,9 @@ var _ = Describe("Integration tests Build and BuildRuns", func() {
 			Expect(err).To(BeNil())
 			Expect(br.Status.CompletionTime).ToNot(BeNil())
 			Expect(br.Status.StartTime).To(BeNil())
-			Expect(br.Status.GetCondition(v1alpha1.Succeeded).Status).To(Equal(corev1.ConditionFalse))
-			Expect(br.Status.GetCondition(v1alpha1.Succeeded).Reason).To(Equal("BuildNotFound"))
-			Expect(br.Status.GetCondition(v1alpha1.Succeeded).Message).To(ContainSubstring("not found"))
+			Expect(br.Status.GetCondition(buildapi.Succeeded).Status).To(Equal(corev1.ConditionFalse))
+			Expect(br.Status.GetCondition(buildapi.Succeeded).Reason).To(Equal("BuildNotFound"))
+			Expect(br.Status.GetCondition(buildapi.Succeeded).Message).To(ContainSubstring("not found"))
 		})
 	})
 
@@ -387,8 +389,7 @@ var _ = Describe("Integration tests Build and BuildRuns", func() {
 
 		})
 
-		It("does not deletes the buildrun if the annotation is changed", func() {
-
+		It("does not delete the buildrun if retention atBuildDeletion is changed to false", func() {
 			Expect(tb.CreateBuild(buildObject)).To(BeNil())
 
 			buildObject, err = tb.GetBuildTillValidation(buildObject.Name)
@@ -403,24 +404,33 @@ var _ = Describe("Integration tests Build and BuildRuns", func() {
 
 			Expect(tb.CreateBR(autoDeleteBuildRun)).To(BeNil())
 
-			_, err = tb.GetBRTillStartTime(autoDeleteBuildRun.Name)
+			// verify that the BuildRun is owned by the bulild
+			br, err := tb.GetBRTillOwner(BUILDRUN+tb.Namespace, buildObject.Name)
 			Expect(err).To(BeNil())
+			Expect(ownerReferenceNames(br.OwnerReferences)).Should(ContainElement(buildObject.Name))
 
-			// we modify the annotation so automatic delete does not take place
-			data := []byte(fmt.Sprintf(`{"metadata":{"annotations":{"%s":"false"}}}`, v1alpha1.AnnotationBuildRunDeletion))
+			// we modify the atBuildDeletion property so that automatic deletion does not take place
+			data := []byte(`{"spec":{"retention":{"atBuildDeletion":false}}}`)
 			_, err = tb.PatchBuild(BUILD+tb.Namespace, data)
 			Expect(err).To(BeNil())
 
-			err = tb.DeleteBuild(BUILD + tb.Namespace)
-			Expect(err).To(BeNil())
-
-			br, err := tb.GetBRTillNotOwner(BUILDRUN+tb.Namespace, buildObject.Name)
+			// wait for the BuildRun to not have an owner anymore
+			br, err = tb.GetBRTillNotOwner(BUILDRUN+tb.Namespace, buildObject.Name)
 			Expect(err).To(BeNil())
 			Expect(ownerReferenceNames(br.OwnerReferences)).ShouldNot(ContainElement(buildObject.Name))
 
-		})
-		It("does not deletes the buildrun if the annotation is removed", func() {
+			// delete the Build
+			err = tb.DeleteBuild(buildObject.Name)
+			Expect(err).To(BeNil())
 
+			// verify that the BuildRun continues to exist
+			Consistently(func() error {
+				_, err := tb.GetBR(BUILDRUN + tb.Namespace)
+				return err
+			}).WithTimeout(5 + time.Second).WithPolling(1 * time.Second).ShouldNot(HaveOccurred())
+		})
+
+		It("does not deletes the buildrun if retention atBuildDeletion is removed", func() {
 			Expect(tb.CreateBuild(buildObject)).To(BeNil())
 
 			buildObject, err = tb.GetBuildTillValidation(buildObject.Name)
@@ -435,22 +445,32 @@ var _ = Describe("Integration tests Build and BuildRuns", func() {
 
 			Expect(tb.CreateBR(autoDeleteBuildRun)).To(BeNil())
 
-			_, err = tb.GetBRTillStartTime(autoDeleteBuildRun.Name)
+			// verify that the BuildRun is owned by the bulild
+			br, err := tb.GetBRTillOwner(BUILDRUN+tb.Namespace, buildObject.Name)
+			Expect(err).To(BeNil())
+			Expect(ownerReferenceNames(br.OwnerReferences)).Should(ContainElement(buildObject.Name))
+
+			// remove the whole retention section
+			buildObject.Spec.Retention = nil
+			err = tb.UpdateBuild(buildObject)
 			Expect(err).To(BeNil())
 
-			// we remove the annotation so automatic delete does not take place, "/" is escaped by "~1" in a JSON pointer
-			data := []byte(fmt.Sprintf(`[{"op":"remove","path":"/metadata/annotations/%s"}]`, strings.ReplaceAll(v1alpha1.AnnotationBuildRunDeletion, "/", "~1")))
-			_, err = tb.PatchBuildWithPatchType(BUILD+tb.Namespace, data, types.JSONPatchType)
-			Expect(err).To(BeNil())
-
-			err = tb.DeleteBuild(BUILD + tb.Namespace)
-			Expect(err).To(BeNil())
-
-			br, err := tb.GetBRTillNotOwner(BUILDRUN+tb.Namespace, buildObject.Name)
+			// wait for the BuildRun to not have an owner anymore
+			br, err = tb.GetBRTillNotOwner(BUILDRUN+tb.Namespace, buildObject.Name)
 			Expect(err).To(BeNil())
 			Expect(ownerReferenceNames(br.OwnerReferences)).ShouldNot(ContainElement(buildObject.Name))
 
+			// delete the Build
+			err = tb.DeleteBuild(buildObject.Name)
+			Expect(err).To(BeNil())
+
+			// verify that the BuildRun continues to exist
+			Consistently(func() error {
+				_, err := tb.GetBR(BUILDRUN + tb.Namespace)
+				return err
+			}).WithTimeout(5 + time.Second).WithPolling(1 * time.Second).ShouldNot(HaveOccurred())
 		})
+
 		It("does delete the buildrun after several modifications of the annotation", func() {
 
 			Expect(tb.CreateBuild(buildObject)).To(BeNil())
@@ -468,25 +488,25 @@ var _ = Describe("Integration tests Build and BuildRuns", func() {
 			Expect(tb.CreateBR(autoDeleteBuildRun)).To(BeNil())
 
 			// we modify the annotation for the automatic deletion to not take place
-			data := []byte(fmt.Sprintf(`{"metadata":{"annotations":{"%s":"false"}}}`, v1alpha1.AnnotationBuildRunDeletion))
+			data := []byte(`{"spec":{"retention":{"atBuildDeletion":false}}}`)
 			_, err = tb.PatchBuild(BUILD+tb.Namespace, data)
 			Expect(err).To(BeNil())
 
 			patchedBuild, err := tb.GetBuild(BUILD + tb.Namespace)
 			Expect(err).To(BeNil())
-			Expect(patchedBuild.Annotations[v1alpha1.AnnotationBuildRunDeletion]).To(Equal("false"))
+			Expect(*patchedBuild.Spec.Retention.AtBuildDeletion).To(Equal(false))
 
 			_, err = tb.GetBRTillStartTime(autoDeleteBuildRun.Name)
 			Expect(err).To(BeNil())
 
 			// we modify the annotation one more time, to validate that the build should be deleted this time
-			data = []byte(fmt.Sprintf(`{"metadata":{"annotations":{"%s":"true"}}}`, v1alpha1.AnnotationBuildRunDeletion))
+			data = []byte(`{"spec":{"retention":{"atBuildDeletion":true}}}`)
 			_, err = tb.PatchBuild(BUILD+tb.Namespace, data)
 			Expect(err).To(BeNil())
 
 			patchedBuild, err = tb.GetBuild(BUILD + tb.Namespace)
 			Expect(err).To(BeNil())
-			Expect(patchedBuild.Annotations[v1alpha1.AnnotationBuildRunDeletion]).To(Equal("true"))
+			Expect(*patchedBuild.Spec.Retention.AtBuildDeletion).To(Equal(true))
 
 			br, err := tb.GetBRTillOwner(BUILDRUN+tb.Namespace, buildObject.Name)
 			Expect(err).To(BeNil())
@@ -514,9 +534,9 @@ var _ = Describe("Integration tests Build and BuildRuns", func() {
 			buildObject, err = tb.GetBuildTillValidation(buildObject.Name)
 			Expect(err).To(BeNil())
 
-			Expect(buildObject.Status.Registered).To(Equal(corev1.ConditionFalse))
-			Expect(buildObject.Status.Reason).To(Equal(v1alpha1.BuildNameInvalid))
-			Expect(buildObject.Status.Message).To(ContainSubstring("must be no more than 63 characters"))
+			Expect(*buildObject.Status.Registered).To(Equal(corev1.ConditionFalse))
+			Expect(*buildObject.Status.Reason).To(Equal(buildapi.BuildNameInvalid))
+			Expect(*buildObject.Status.Message).To(ContainSubstring("must be no more than 63"))
 		})
 	})
 	Context("when a build generateName is provided but none name", func() {
@@ -540,9 +560,9 @@ var _ = Describe("Integration tests Build and BuildRuns", func() {
 			buildObject, err = tb.GetBuildTillValidation(buildList.Items[0].Name)
 			Expect(err).To(BeNil())
 
-			Expect(buildObject.Status.Registered).To(Equal(corev1.ConditionTrue))
-			Expect(buildObject.Status.Reason).To(Equal(v1alpha1.SucceedStatus))
-			Expect(buildObject.Status.Message).To(Equal(v1alpha1.AllValidationsSucceeded))
+			Expect(*buildObject.Status.Registered).To(Equal(corev1.ConditionTrue))
+			Expect(*buildObject.Status.Reason).To(Equal(buildapi.SucceedStatus))
+			Expect(*buildObject.Status.Message).To(Equal(buildapi.AllValidationsSucceeded))
 		})
 	})
 })

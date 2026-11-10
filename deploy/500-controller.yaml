@@ -1,3 +1,4 @@
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -13,6 +14,8 @@ spec:
       labels:
         name: shipwright-build
     spec:
+      securityContext:
+        runAsNonRoot: true
       serviceAccountName: shipwright-build-controller
       containers:
         - name: shipwright-build
@@ -34,10 +37,14 @@ spec:
               value: "shipwright-build"
             - name: GIT_CONTAINER_IMAGE
               value: ko://github.com/shipwright-io/build/cmd/git
-            - name: MUTATE_IMAGE_CONTAINER_IMAGE
-              value: ko://github.com/shipwright-io/build/cmd/mutate-image
+            - name: GIT_ENABLE_REWRITE_RULE
+              value: "false"
+            - name: IMAGE_PROCESSING_CONTAINER_IMAGE
+              value: ko://github.com/shipwright-io/build/cmd/image-processing
             - name: BUNDLE_CONTAINER_IMAGE
               value: ko://github.com/shipwright-io/build/cmd/bundle
+            - name: WAITER_CONTAINER_IMAGE
+              value: ko://github.com/shipwright-io/build/cmd/waiter
           ports:
             - containerPort: 8383
               name: metrics-port
@@ -53,3 +60,13 @@ spec:
               port: metrics-port
             initialDelaySeconds: 5
             periodSeconds: 10
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            seccompProfile:
+              type: RuntimeDefault

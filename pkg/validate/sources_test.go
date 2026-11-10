@@ -1,53 +1,63 @@
 // Copyright The Shipwright Contributors
 //
 // SPDX-License-Identifier: Apache-2.0
-package validate
+
+package validate_test
 
 import (
 	"context"
-	"testing"
 
-	build "github.com/shipwright-io/build/pkg/apis/build/v1alpha1"
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+
+	buildapi "github.com/shipwright-io/build/pkg/apis/build/v1beta1"
+	"github.com/shipwright-io/build/pkg/validate"
 )
 
-func TestSourcesRef_ValidatePath(t *testing.T) {
-	testCases := []struct {
-		description string
-		expectError bool
-		b           *build.Build
-	}{{
-		description: "empty sources slice",
-		expectError: false,
-		b:           &build.Build{},
-	}, {
-		description: "name is not informed",
-		expectError: true,
-		b: &build.Build{Spec: build.BuildSpec{Sources: &[]build.BuildSource{{
-			Name: "",
-		}}}},
-	}, {
-		description: "URL is not informed",
-		expectError: true,
-		b: &build.Build{Spec: build.BuildSpec{Sources: &[]build.BuildSource{{
-			Name: "name",
-			URL:  "",
-		}}}},
-	}, {
-		description: "invalid URL",
-		expectError: true,
-		b: &build.Build{Spec: build.BuildSpec{Sources: &[]build.BuildSource{{
-			Name: "name",
-			URL:  "invalid URL",
-		}}}},
-	}}
+var _ = Describe("SourcesRef", func() {
+	Context("ValidatePath", func() {
+		It("should successfully validate an empty source", func() {
+			srcRef := validate.NewSourceRef(&buildapi.Build{})
 
-	for _, tc := range testCases {
-		s := &SourcesRef{Build: tc.b}
-		ctx := context.TODO()
-		err := s.ValidatePath(ctx)
+			Expect(srcRef.ValidatePath(context.TODO())).To(BeNil())
+		})
 
-		if (tc.expectError && err == nil) || (!tc.expectError && err != nil) {
-			t.Fatalf("%s: expectError='%v', err='%v'", tc.description, tc.expectError, err)
-		}
-	}
-}
+		It("should successfully validate a build with source", func() {
+			srcRef := validate.NewSourceRef(&buildapi.Build{
+				Spec: buildapi.BuildSpec{
+					Source: &buildapi.Source{
+						Type: buildapi.GitType,
+						Git:  &buildapi.Git{},
+					},
+				},
+			})
+
+			Expect(srcRef.ValidatePath(context.TODO())).To(BeNil())
+		})
+
+		It("should fail to validate if the type is not defined", func() {
+			srcRef := validate.NewSourceRef(&buildapi.Build{
+				Spec: buildapi.BuildSpec{
+					Source: &buildapi.Source{
+						Git: &buildapi.Git{},
+					},
+				},
+			})
+
+			Expect(srcRef.ValidatePath(context.TODO())).To(HaveOccurred())
+		})
+
+		It("should fail to validate if the type does not match the source git", func() {
+			srcRef := validate.NewSourceRef(&buildapi.Build{
+				Spec: buildapi.BuildSpec{
+					Source: &buildapi.Source{
+						Type: buildapi.OCIArtifactType,
+						Git:  &buildapi.Git{},
+					},
+				},
+			})
+
+			Expect(srcRef.ValidatePath(context.TODO())).To(HaveOccurred())
+		})
+	})
+})

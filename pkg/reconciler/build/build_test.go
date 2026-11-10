@@ -7,24 +7,24 @@ package build_test
 import (
 	"context"
 	"fmt"
+	"strings"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 	crc "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	build "github.com/shipwright-io/build/pkg/apis/build/v1alpha1"
+	buildapi "github.com/shipwright-io/build/pkg/apis/build/v1beta1"
 	"github.com/shipwright-io/build/pkg/config"
 	"github.com/shipwright-io/build/pkg/controller/fakes"
-	"github.com/shipwright-io/build/pkg/ctxlog"
 	buildController "github.com/shipwright-io/build/pkg/reconciler/build"
-	"github.com/shipwright-io/build/test"
+	test "github.com/shipwright-io/build/test/v1beta1_samples"
 )
 
 var _ = Describe("Reconcile Build", func() {
@@ -32,9 +32,9 @@ var _ = Describe("Reconcile Build", func() {
 		manager                      *fakes.FakeManager
 		reconciler                   reconcile.Reconciler
 		request                      reconcile.Request
-		buildSample                  *build.Build
+		buildSample                  *buildapi.Build
 		secretSample                 *corev1.Secret
-		clusterBuildStrategySample   *build.ClusterBuildStrategy
+		clusterBuildStrategySample   *buildapi.ClusterBuildStrategy
 		client                       *fakes.FakeClient
 		ctl                          test.Catalog
 		statusWriter                 *fakes.FakeStatusWriter
@@ -56,11 +56,11 @@ var _ = Describe("Reconcile Build", func() {
 		// Fake the client GET calls when reconciling,
 		// in order to get our Build CRD instance
 		client = &fakes.FakeClient{}
-		client.GetCalls(func(context context.Context, nn types.NamespacedName, object runtime.Object) error {
+		client.GetCalls(func(_ context.Context, nn types.NamespacedName, object crc.Object, getOptions ...crc.GetOption) error {
 			switch object := object.(type) {
-			case *build.Build:
+			case *buildapi.Build:
 				buildSample.DeepCopyInto(object)
-			case *build.ClusterBuildStrategy:
+			case *buildapi.ClusterBuildStrategy:
 				clusterBuildStrategySample.DeepCopyInto(object)
 			default:
 				return errors.NewNotFound(schema.GroupResource{}, "schema not found")
@@ -77,39 +77,35 @@ var _ = Describe("Reconcile Build", func() {
 		buildSample = ctl.BuildWithClusterBuildStrategy(buildName, namespace, buildStrategyName, registrySecret)
 		clusterBuildStrategySample = ctl.ClusterBuildStrategy(buildStrategyName)
 		// Reconcile
-		testCtx := ctxlog.NewContext(context.TODO(), "fake-logger")
-		reconciler = buildController.NewReconciler(testCtx, config.NewDefaultConfig(), manager, controllerutil.SetControllerReference)
+		reconciler = buildController.NewReconciler(config.NewDefaultConfig(), manager, controllerutil.SetControllerReference)
 	})
 
 	Describe("Reconcile", func() {
 		Context("when source secret is specified", func() {
 			It("fails when the secret does not exist", func() {
-				buildSample.Spec.Source.Credentials = &corev1.LocalObjectReference{
-					Name: "non-existing",
-				}
-				buildSample.Spec.Output.Credentials = nil
+				buildSample.Spec.Source.Git.CloneSecret = ptr.To("non-existing")
 
-				statusCall := ctl.StubFunc(corev1.ConditionFalse, build.SpecSourceSecretRefNotFound, "referenced secret non-existing not found")
+				buildSample.Spec.Output.PushSecret = nil
+
+				statusCall := ctl.StubFunc(corev1.ConditionFalse, buildapi.SpecSourceSecretRefNotFound, "referenced secret non-existing not found")
 				statusWriter.UpdateCalls(statusCall)
 
-				_, err := reconciler.Reconcile(request)
+				_, err := reconciler.Reconcile(context.TODO(), request)
 				Expect(err).To(BeNil())
 				Expect(statusWriter.UpdateCallCount()).To(Equal(1))
 			})
 
 			It("succeeds when the secret exists foobar", func() {
-				buildSample.Spec.Source.Credentials = &corev1.LocalObjectReference{
-					Name: "existing",
-				}
-				buildSample.Spec.Output.Credentials = nil
+				buildSample.Spec.Source.Git.CloneSecret = ptr.To("existing")
+				buildSample.Spec.Output.PushSecret = nil
 
 				// Fake some client Get calls and ensure we populate all
 				// different resources we could get during reconciliation
-				client.GetCalls(func(context context.Context, nn types.NamespacedName, object runtime.Object) error {
+				client.GetCalls(func(_ context.Context, nn types.NamespacedName, object crc.Object, getOptions ...crc.GetOption) error {
 					switch object := object.(type) {
-					case *build.Build:
+					case *buildapi.Build:
 						buildSample.DeepCopyInto(object)
-					case *build.ClusterBuildStrategy:
+					case *buildapi.ClusterBuildStrategy:
 						clusterBuildStrategySample.DeepCopyInto(object)
 					case *corev1.Secret:
 						secretSample = ctl.SecretWithoutAnnotation("existing", namespace)
@@ -118,62 +114,10 @@ var _ = Describe("Reconcile Build", func() {
 					return nil
 				})
 
-				statusCall := ctl.StubFunc(corev1.ConditionTrue, build.SucceedStatus, "all validations succeeded")
+				statusCall := ctl.StubFunc(corev1.ConditionTrue, buildapi.SucceedStatus, "all validations succeeded")
 				statusWriter.UpdateCalls(statusCall)
 
-				result, err := reconciler.Reconcile(request)
-				Expect(err).ToNot(HaveOccurred())
-				Expect(statusWriter.UpdateCallCount()).To(Equal(1))
-				Expect(reconcile.Result{}).To(Equal(result))
-			})
-		})
-
-		Context("when builder image secret is specified", func() {
-			It("fails when the secret does not exist", func() {
-				buildSample.Spec.Builder = &build.Image{
-					Image: "busybox",
-					Credentials: &corev1.LocalObjectReference{
-						Name: "non-existing",
-					},
-				}
-				buildSample.Spec.Output.Credentials = nil
-
-				statusCall := ctl.StubFunc(corev1.ConditionFalse, build.SpecBuilderSecretRefNotFound, "referenced secret non-existing not found")
-				statusWriter.UpdateCalls(statusCall)
-
-				_, err := reconciler.Reconcile(request)
-				Expect(err).To(BeNil())
-				Expect(statusWriter.UpdateCallCount()).To(Equal(1))
-			})
-
-			It("succeeds when the secret exists", func() {
-				buildSample.Spec.Builder = &build.Image{
-					Image: "busybox",
-					Credentials: &corev1.LocalObjectReference{
-						Name: "existing",
-					},
-				}
-				buildSample.Spec.Output.Credentials = nil
-
-				// Fake some client Get calls and ensure we populate all
-				// different resources we could get during reconciliation
-				client.GetCalls(func(context context.Context, nn types.NamespacedName, object runtime.Object) error {
-					switch object := object.(type) {
-					case *build.Build:
-						buildSample.DeepCopyInto(object)
-					case *build.ClusterBuildStrategy:
-						clusterBuildStrategySample.DeepCopyInto(object)
-					case *corev1.Secret:
-						secretSample = ctl.SecretWithoutAnnotation("existing", namespace)
-						secretSample.DeepCopyInto(object)
-					}
-					return nil
-				})
-
-				statusCall := ctl.StubFunc(corev1.ConditionTrue, build.SucceedStatus, "all validations succeeded")
-				statusWriter.UpdateCalls(statusCall)
-
-				result, err := reconciler.Reconcile(request)
+				result, err := reconciler.Reconcile(context.TODO(), request)
 				Expect(err).ToNot(HaveOccurred())
 				Expect(statusWriter.UpdateCallCount()).To(Equal(1))
 				Expect(reconcile.Result{}).To(Equal(result))
@@ -183,21 +127,22 @@ var _ = Describe("Reconcile Build", func() {
 		Context("when spec output registry secret is specified", func() {
 			It("fails when the secret does not exist", func() {
 
-				statusCall := ctl.StubFunc(corev1.ConditionFalse, build.SpecOutputSecretRefNotFound, fmt.Sprintf("referenced secret %s not found", registrySecret))
+				statusCall := ctl.StubFunc(corev1.ConditionFalse, buildapi.SpecOutputSecretRefNotFound, fmt.Sprintf("referenced secret %s not found", registrySecret))
 				statusWriter.UpdateCalls(statusCall)
 
-				_, err := reconciler.Reconcile(request)
+				_, err := reconciler.Reconcile(context.TODO(), request)
 				Expect(err).To(BeNil())
 				Expect(statusWriter.UpdateCallCount()).To(Equal(1))
 			})
+
 			It("succeed when the secret exists", func() {
 				// Fake some client Get calls and ensure we populate all
 				// different resources we could get during reconciliation
-				client.GetCalls(func(context context.Context, nn types.NamespacedName, object runtime.Object) error {
+				client.GetCalls(func(_ context.Context, nn types.NamespacedName, object crc.Object, getOptions ...crc.GetOption) error {
 					switch object := object.(type) {
-					case *build.Build:
+					case *buildapi.Build:
 						buildSample.DeepCopyInto(object)
-					case *build.ClusterBuildStrategy:
+					case *buildapi.ClusterBuildStrategy:
 						clusterBuildStrategySample.DeepCopyInto(object)
 					case *corev1.Secret:
 						secretSample = ctl.SecretWithoutAnnotation("existing", namespace)
@@ -206,10 +151,10 @@ var _ = Describe("Reconcile Build", func() {
 					return nil
 				})
 
-				statusCall := ctl.StubFunc(corev1.ConditionTrue, build.SucceedStatus, "all validations succeeded")
+				statusCall := ctl.StubFunc(corev1.ConditionTrue, buildapi.SucceedStatus, "all validations succeeded")
 				statusWriter.UpdateCalls(statusCall)
 
-				result, err := reconciler.Reconcile(request)
+				result, err := reconciler.Reconcile(context.TODO(), request)
 				Expect(err).ToNot(HaveOccurred())
 				Expect(statusWriter.UpdateCallCount()).To(Equal(1))
 				Expect(reconcile.Result{}).To(Equal(result))
@@ -218,17 +163,13 @@ var _ = Describe("Reconcile Build", func() {
 
 		Context("when source secret and output secret are specified", func() {
 			It("fails when both secrets do not exist", func() {
-				buildSample.Spec.Source.Credentials = &corev1.LocalObjectReference{
-					Name: "non-existing-source",
-				}
-				buildSample.Spec.Output.Credentials = &corev1.LocalObjectReference{
-					Name: "non-existing-output",
-				}
+				buildSample.Spec.Source.Git.CloneSecret = ptr.To("non-existing-source")
+				buildSample.Spec.Output.PushSecret = ptr.To("non-existing-output")
 
-				statusCall := ctl.StubFunc(corev1.ConditionFalse, build.MultipleSecretRefNotFound, "missing secrets are non-existing-output,non-existing-source")
+				statusCall := ctl.StubFunc(corev1.ConditionFalse, buildapi.MultipleSecretRefNotFound, "missing secrets are non-existing-output,non-existing-source")
 				statusWriter.UpdateCalls(statusCall)
 
-				_, err := reconciler.Reconcile(request)
+				_, err := reconciler.Reconcile(context.TODO(), request)
 				Expect(err).To(BeNil())
 				Expect(statusWriter.UpdateCallCount()).To(Equal(1))
 			})
@@ -236,14 +177,13 @@ var _ = Describe("Reconcile Build", func() {
 
 		Context("when spec strategy ClusterBuildStrategy is specified", func() {
 			It("fails when the strategy does not exists", func() {
-
 				// Fake some client Get calls and ensure we populate all
 				// different resources we could get during reconciliation
-				client.GetCalls(func(context context.Context, nn types.NamespacedName, object runtime.Object) error {
+				client.GetCalls(func(_ context.Context, nn types.NamespacedName, object crc.Object, getOptions ...crc.GetOption) error {
 					switch object := object.(type) {
-					case *build.Build:
+					case *buildapi.Build:
 						buildSample.DeepCopyInto(object)
-					case *build.ClusterBuildStrategy:
+					case *buildapi.ClusterBuildStrategy:
 						return ctl.FakeClusterBuildStrategyNotFound("ss")
 					case *corev1.Secret:
 						secretSample = ctl.SecretWithoutAnnotation("existing", namespace)
@@ -252,22 +192,22 @@ var _ = Describe("Reconcile Build", func() {
 					return nil
 				})
 
-				statusCall := ctl.StubFunc(corev1.ConditionFalse, build.ClusterBuildStrategyNotFound, fmt.Sprintf("clusterBuildStrategy %s does not exist", buildStrategyName))
+				statusCall := ctl.StubFunc(corev1.ConditionFalse, buildapi.ClusterBuildStrategyNotFound, fmt.Sprintf("clusterBuildStrategy %s does not exist", buildStrategyName))
 				statusWriter.UpdateCalls(statusCall)
 
-				_, err := reconciler.Reconcile(request)
+				_, err := reconciler.Reconcile(context.TODO(), request)
 				Expect(err).To(BeNil())
 				Expect(statusWriter.UpdateCallCount()).To(Equal(1))
 			})
-			It("succeed when the strategy exists", func() {
 
+			It("succeed when the strategy exists", func() {
 				// Fake some client Get calls and ensure we populate all
 				// different resources we could get during reconciliation
-				client.GetCalls(func(context context.Context, nn types.NamespacedName, object runtime.Object) error {
+				client.GetCalls(func(_ context.Context, nn types.NamespacedName, object crc.Object, getOptions ...crc.GetOption) error {
 					switch object := object.(type) {
-					case *build.Build:
+					case *buildapi.Build:
 						buildSample.DeepCopyInto(object)
-					case *build.ClusterBuildStrategy:
+					case *buildapi.ClusterBuildStrategy:
 						clusterBuildStrategySample.DeepCopyInto(object)
 					case *corev1.Secret:
 						secretSample = ctl.SecretWithoutAnnotation("existing", namespace)
@@ -276,10 +216,10 @@ var _ = Describe("Reconcile Build", func() {
 					return nil
 				})
 
-				statusCall := ctl.StubFunc(corev1.ConditionTrue, build.SucceedStatus, "all validations succeeded")
+				statusCall := ctl.StubFunc(corev1.ConditionTrue, buildapi.SucceedStatus, "all validations succeeded")
 				statusWriter.UpdateCalls(statusCall)
 
-				result, err := reconciler.Reconcile(request)
+				result, err := reconciler.Reconcile(context.TODO(), request)
 				Expect(err).ToNot(HaveOccurred())
 				Expect(statusWriter.UpdateCallCount()).To(Equal(1))
 				Expect(reconcile.Result{}).To(Equal(result))
@@ -295,33 +235,32 @@ var _ = Describe("Reconcile Build", func() {
 			})
 
 			It("fails when the strategy does not exists", func() {
-
-				statusCall := ctl.StubFunc(corev1.ConditionFalse, build.BuildStrategyNotFound, fmt.Sprintf("buildStrategy %s does not exist in namespace %s", buildStrategyName, namespace))
+				statusCall := ctl.StubFunc(corev1.ConditionFalse, buildapi.BuildStrategyNotFound, fmt.Sprintf("buildStrategy %s does not exist in namespace %s", buildStrategyName, namespace))
 				statusWriter.UpdateCalls(statusCall)
 
-				_, err := reconciler.Reconcile(request)
+				_, err := reconciler.Reconcile(context.TODO(), request)
 				Expect(err).To(BeNil())
 				Expect(statusWriter.UpdateCallCount()).To(Equal(1))
 			})
-			It("succeed when the strategy exists", func() {
 
+			It("succeed when the strategy exists", func() {
 				// Fake some client Get calls and ensure we populate all
 				// different resources we could get during reconciliation
-				client.GetCalls(func(context context.Context, nn types.NamespacedName, object runtime.Object) error {
+				client.GetCalls(func(_ context.Context, nn types.NamespacedName, object crc.Object, getOptions ...crc.GetOption) error {
 					switch object := object.(type) {
-					case *build.Build:
+					case *buildapi.Build:
 						buildSample.DeepCopyInto(object)
-					case *build.BuildStrategy:
+					case *buildapi.BuildStrategy:
 						namespacedBuildStrategy := ctl.DefaultNamespacedBuildStrategy()
 						namespacedBuildStrategy.DeepCopyInto(object)
 					}
 					return nil
 				})
 
-				statusCall := ctl.StubFunc(corev1.ConditionTrue, build.SucceedStatus, "all validations succeeded")
+				statusCall := ctl.StubFunc(corev1.ConditionTrue, buildapi.SucceedStatus, "all validations succeeded")
 				statusWriter.UpdateCalls(statusCall)
 
-				result, err := reconciler.Reconcile(request)
+				result, err := reconciler.Reconcile(context.TODO(), request)
 				Expect(err).ToNot(HaveOccurred())
 				Expect(statusWriter.UpdateCallCount()).To(Equal(1))
 				Expect(reconcile.Result{}).To(Equal(result))
@@ -335,90 +274,114 @@ var _ = Describe("Reconcile Build", func() {
 				// Override the buildSample to use a BuildStrategy instead of the Cluster one, although the build strategy kind is nil
 				buildSample = ctl.BuildWithNilBuildStrategyKind(buildName, namespace, buildStrategyName)
 			})
-			It("default to BuildStrategy and fails when the strategy does not exists", func() {
 
-				statusCall := ctl.StubFunc(corev1.ConditionFalse, build.BuildStrategyNotFound, fmt.Sprintf("buildStrategy %s does not exist in namespace %s", buildStrategyName, namespace))
+			It("default to BuildStrategy and fails when the strategy does not exists", func() {
+				statusCall := ctl.StubFunc(corev1.ConditionFalse, buildapi.BuildStrategyNotFound, fmt.Sprintf("buildStrategy %s does not exist in namespace %s", buildStrategyName, namespace))
 				statusWriter.UpdateCalls(statusCall)
 
-				_, err := reconciler.Reconcile(request)
+				_, err := reconciler.Reconcile(context.TODO(), request)
 				Expect(err).To(BeNil())
 				Expect(statusWriter.UpdateCallCount()).To(Equal(1))
-
 			})
+
 			It("default to BuildStrategy and succeed if the strategy exists", func() {
 				// Fake some client Get calls and ensure we populate all
 				// different resources we could get during reconciliation
-				client.GetCalls(func(context context.Context, nn types.NamespacedName, object runtime.Object) error {
+				client.GetCalls(func(_ context.Context, nn types.NamespacedName, object crc.Object, getOptions ...crc.GetOption) error {
 					switch object := object.(type) {
-					case *build.Build:
+					case *buildapi.Build:
 						buildSample.DeepCopyInto(object)
-					case *build.BuildStrategy:
+					case *buildapi.BuildStrategy:
 						namespacedBuildStrategy := ctl.DefaultNamespacedBuildStrategy()
 						namespacedBuildStrategy.DeepCopyInto(object)
 					}
 					return nil
 				})
 
-				statusCall := ctl.StubFunc(corev1.ConditionTrue, build.SucceedStatus, "all validations succeeded")
+				statusCall := ctl.StubFunc(corev1.ConditionTrue, buildapi.SucceedStatus, "all validations succeeded")
 				statusWriter.UpdateCalls(statusCall)
 
-				result, err := reconciler.Reconcile(request)
+				result, err := reconciler.Reconcile(context.TODO(), request)
 				Expect(err).ToNot(HaveOccurred())
 				Expect(statusWriter.UpdateCallCount()).To(Equal(1))
 				Expect(reconcile.Result{}).To(Equal(result))
 			})
 		})
 
+		Context("when spec strategy kind is unknown", func() {
+			JustBeforeEach(func() {
+				buildStrategyKind := buildapi.BuildStrategyKind("abc")
+				buildStrategyName = "xyz"
+				buildName = "build-name"
+				buildSample = ctl.BuildWithNilBuildStrategyKind(buildName, namespace, buildStrategyName)
+				buildSample.Spec.Strategy.Kind = &buildStrategyKind
+			})
+
+			It("should fail validation and update the status to indicate that the strategy kind is unknown", func() {
+				statusWriter.UpdateCalls(func(ctx context.Context, o crc.Object, sruo ...crc.SubResourceUpdateOption) error {
+					Expect(o).To(BeAssignableToTypeOf(&buildapi.Build{}))
+					b := o.(*buildapi.Build)
+					Expect(b.Status.Reason).ToNot(BeNil())
+					Expect(*b.Status.Reason).To(Equal(buildapi.UnknownBuildStrategyKind))
+					return nil
+				})
+
+				_, err := reconciler.Reconcile(context.TODO(), request)
+				Expect(err).To(BeNil())
+				Expect(statusWriter.UpdateCallCount()).To(Equal(1))
+			})
+		})
+
 		Context("when source URL is specified", func() {
 			// validate file protocol
 			It("fails when source URL is invalid", func() {
-				buildSample.Spec.Source.URL = "foobar"
+				buildSample.Spec.Source.Git.URL = "foobar"
 				buildSample.SetAnnotations(map[string]string{
-					build.AnnotationBuildVerifyRepository: "true",
+					buildapi.AnnotationBuildVerifyRepository: "true",
 				})
-				statusCall := ctl.StubFunc(corev1.ConditionFalse, build.RemoteRepositoryUnreachable, "invalid source url")
+				statusCall := ctl.StubFunc(corev1.ConditionFalse, buildapi.RemoteRepositoryUnreachable, "invalid source url")
 				statusWriter.UpdateCalls(statusCall)
 
-				_, err := reconciler.Reconcile(request)
+				_, err := reconciler.Reconcile(context.TODO(), request)
 				Expect(err).To(BeNil())
 				Expect(statusWriter.UpdateCallCount()).To(Equal(1))
 			})
 
 			// validate https protocol
 			It("fails when public source URL is unreachable", func() {
-				buildSample.Spec.Source.URL = "https://github.com/shipwright-io/sample-go-fake"
+				buildSample.Spec.Source.Git.URL = "https://github.com/shipwright-io/sample-go-fake"
 				buildSample.SetAnnotations(map[string]string{
-					build.AnnotationBuildVerifyRepository: "true",
+					buildapi.AnnotationBuildVerifyRepository: "true",
 				})
 
-				statusCall := ctl.StubFunc(corev1.ConditionFalse, build.RemoteRepositoryUnreachable, "remote repository unreachable")
+				statusCall := ctl.StubFunc(corev1.ConditionFalse, buildapi.RemoteRepositoryUnreachable, "remote repository unreachable")
 				statusWriter.UpdateCalls(statusCall)
 
-				_, err := reconciler.Reconcile(request)
+				_, err := reconciler.Reconcile(context.TODO(), request)
 				Expect(err).To(BeNil())
 				Expect(statusWriter.UpdateCallCount()).To(Equal(1))
 			})
 
 			// skip validation because of empty sourceURL annotation
 			It("succeed when source URL is invalid because source annotation is empty", func() {
-				buildSample.Spec.Source.URL = "foobar"
+				buildSample.Spec.Source.Git.URL = "foobar"
 
 				// Fake some client Get calls and ensure we populate all
 				// different resources we could get during reconciliation
-				client.GetCalls(func(context context.Context, nn types.NamespacedName, object runtime.Object) error {
+				client.GetCalls(func(_ context.Context, nn types.NamespacedName, object crc.Object, getOptions ...crc.GetOption) error {
 					switch object := object.(type) {
-					case *build.Build:
+					case *buildapi.Build:
 						buildSample.DeepCopyInto(object)
-					case *build.ClusterBuildStrategy:
+					case *buildapi.ClusterBuildStrategy:
 						clusterBuildStrategySample.DeepCopyInto(object)
 					}
 					return nil
 				})
 
-				statusCall := ctl.StubFunc(corev1.ConditionTrue, build.SucceedStatus, build.AllValidationsSucceeded)
+				statusCall := ctl.StubFunc(corev1.ConditionTrue, buildapi.SucceedStatus, buildapi.AllValidationsSucceeded)
 				statusWriter.UpdateCalls(statusCall)
 
-				result, err := reconciler.Reconcile(request)
+				result, err := reconciler.Reconcile(context.TODO(), request)
 				Expect(err).ToNot(HaveOccurred())
 				Expect(statusWriter.UpdateCallCount()).To(Equal(1))
 				Expect(reconcile.Result{}).To(Equal(result))
@@ -430,20 +393,20 @@ var _ = Describe("Reconcile Build", func() {
 
 				// Fake some client Get calls and ensure we populate all
 				// different resources we could get during reconciliation
-				client.GetCalls(func(context context.Context, nn types.NamespacedName, object runtime.Object) error {
+				client.GetCalls(func(_ context.Context, nn types.NamespacedName, object crc.Object, getOptions ...crc.GetOption) error {
 					switch object := object.(type) {
-					case *build.Build:
+					case *buildapi.Build:
 						buildSample.DeepCopyInto(object)
-					case *build.ClusterBuildStrategy:
+					case *buildapi.ClusterBuildStrategy:
 						clusterBuildStrategySample.DeepCopyInto(object)
 					}
 					return nil
 				})
 
-				statusCall := ctl.StubFunc(corev1.ConditionTrue, build.SucceedStatus, build.AllValidationsSucceeded)
+				statusCall := ctl.StubFunc(corev1.ConditionTrue, buildapi.SucceedStatus, buildapi.AllValidationsSucceeded)
 				statusWriter.UpdateCalls(statusCall)
 
-				result, err := reconciler.Reconcile(request)
+				result, err := reconciler.Reconcile(context.TODO(), request)
 				Expect(err).ToNot(HaveOccurred())
 				Expect(statusWriter.UpdateCallCount()).To(Equal(1))
 				Expect(reconcile.Result{}).To(Equal(result))
@@ -452,29 +415,247 @@ var _ = Describe("Reconcile Build", func() {
 			// skip validation because build references a sourceURL secret
 			It("succeed when source URL is fake private URL because build reference a sourceURL secret", func() {
 				buildSample := ctl.BuildWithClusterBuildStrategyAndSourceSecret(buildName, namespace, buildStrategyName)
-				buildSample.Spec.Source.URL = "https://github.yourco.com/org/build-fake"
-				buildSample.Spec.Source.Credentials.Name = registrySecret
+				buildSample.Spec.Source.Git.URL = "https://github.yourco.com/org/build-fake"
+				buildSample.Spec.Source.Git.CloneSecret = ptr.To(registrySecret)
 
 				// Fake some client Get calls and ensure we populate all
 				// different resources we could get during reconciliation
-				client.GetCalls(func(context context.Context, nn types.NamespacedName, object runtime.Object) error {
+				client.GetCalls(func(_ context.Context, nn types.NamespacedName, object crc.Object, getOptions ...crc.GetOption) error {
 					switch object := object.(type) {
-					case *build.Build:
+					case *buildapi.Build:
 						buildSample.DeepCopyInto(object)
-					case *build.ClusterBuildStrategy:
+					case *buildapi.ClusterBuildStrategy:
 						clusterBuildStrategySample.DeepCopyInto(object)
 					}
 
 					return nil
 				})
 
-				statusCall := ctl.StubFunc(corev1.ConditionTrue, build.SucceedStatus, build.AllValidationsSucceeded)
+				statusCall := ctl.StubFunc(corev1.ConditionTrue, buildapi.SucceedStatus, buildapi.AllValidationsSucceeded)
 				statusWriter.UpdateCalls(statusCall)
 
-				result, err := reconciler.Reconcile(request)
+				result, err := reconciler.Reconcile(context.TODO(), request)
 				Expect(err).ToNot(HaveOccurred())
 				Expect(statusWriter.UpdateCallCount()).To(Equal(1))
 				Expect(reconcile.Result{}).To(Equal(result))
+			})
+		})
+
+		Context("when environment variables are specified", func() {
+			JustBeforeEach(func() {
+				buildSample.Spec.Source.Git.CloneSecret = ptr.To("existing")
+				buildSample.Spec.Output.PushSecret = nil
+
+				// Fake some client Get calls and ensure we populate all
+				// different resources we could get during reconciliation
+				client.GetCalls(func(_ context.Context, nn types.NamespacedName, object crc.Object, getOptions ...crc.GetOption) error {
+					switch object := object.(type) {
+					case *buildapi.Build:
+						buildSample.DeepCopyInto(object)
+					case *buildapi.ClusterBuildStrategy:
+						clusterBuildStrategySample.DeepCopyInto(object)
+					case *corev1.Secret:
+						secretSample = ctl.SecretWithoutAnnotation("existing", namespace)
+						secretSample.DeepCopyInto(object)
+					}
+					return nil
+				})
+			})
+
+			It("fails when the name is blank", func() {
+				buildSample.Spec.Env = []corev1.EnvVar{
+					{
+						Name:  "",
+						Value: "some-value",
+					},
+				}
+
+				statusCall := ctl.StubFunc(corev1.ConditionFalse, buildapi.SpecEnvNameCanNotBeBlank, "name for environment variable must not be blank")
+				statusWriter.UpdateCalls(statusCall)
+
+				_, err := reconciler.Reconcile(context.TODO(), request)
+				Expect(err).To(BeNil())
+				Expect(statusWriter.UpdateCallCount()).To(Equal(1))
+
+			})
+			It("fails when the name is blank using valueFrom", func() {
+				buildSample.Spec.Env = []corev1.EnvVar{
+					{
+						Name: "",
+						ValueFrom: &corev1.EnvVarSource{
+							FieldRef: &corev1.ObjectFieldSelector{
+								FieldPath: "my-field-path",
+							},
+						},
+					},
+				}
+
+				statusCall := ctl.StubFunc(corev1.ConditionFalse, buildapi.SpecEnvNameCanNotBeBlank, "name for environment variable must not be blank")
+				statusWriter.UpdateCalls(statusCall)
+
+				_, err := reconciler.Reconcile(context.TODO(), request)
+				Expect(err).To(BeNil())
+				Expect(statusWriter.UpdateCallCount()).To(Equal(1))
+
+			})
+			It("fails when both value and valueFrom are specified", func() {
+				buildSample.Spec.Env = []corev1.EnvVar{
+					{
+						Name:  "some-name",
+						Value: "some-value",
+						ValueFrom: &corev1.EnvVarSource{
+							FieldRef: &corev1.ObjectFieldSelector{
+								FieldPath: "my-field-path",
+							},
+						},
+					},
+				}
+
+				statusCall := ctl.StubFunc(corev1.ConditionFalse, buildapi.SpecEnvOnlyOneOfValueOrValueFromMustBeSpecified, "only one of value or valueFrom must be specified")
+				statusWriter.UpdateCalls(statusCall)
+
+				_, err := reconciler.Reconcile(context.TODO(), request)
+				Expect(err).To(BeNil())
+				Expect(statusWriter.UpdateCallCount()).To(Equal(1))
+
+			})
+			It("succeeds with compliant env var using Value", func() {
+				buildSample.Spec.Env = []corev1.EnvVar{
+					{
+						Name:  "some-name",
+						Value: "some-value",
+					},
+				}
+
+				statusCall := ctl.StubFunc(corev1.ConditionTrue, buildapi.BuildReason(buildapi.Succeeded), "all validations succeeded")
+				statusWriter.UpdateCalls(statusCall)
+
+				_, err := reconciler.Reconcile(context.TODO(), request)
+				Expect(err).To(BeNil())
+				Expect(statusWriter.UpdateCallCount()).To(Equal(1))
+
+			})
+			It("succeeds with compliant env var using ValueFrom", func() {
+				buildSample.Spec.Env = []corev1.EnvVar{
+					{
+						Name: "some-name",
+						ValueFrom: &corev1.EnvVarSource{
+							FieldRef: &corev1.ObjectFieldSelector{
+								FieldPath: "my-field-path",
+							},
+						},
+					},
+				}
+
+				statusCall := ctl.StubFunc(corev1.ConditionTrue, buildapi.BuildReason(buildapi.Succeeded), "all validations succeeded")
+				statusWriter.UpdateCalls(statusCall)
+
+				_, err := reconciler.Reconcile(context.TODO(), request)
+				Expect(err).To(BeNil())
+				Expect(statusWriter.UpdateCallCount()).To(Equal(1))
+
+			})
+		})
+
+		Context("when build object is not in the cluster (anymore)", func() {
+			It("should finish reconciling when the build cannot be found", func() {
+				client.GetCalls(func(_ context.Context, nn types.NamespacedName, o crc.Object, getOptions ...crc.GetOption) error {
+					return errors.NewNotFound(buildapi.Resource("build"), nn.Name)
+				})
+
+				_, err := reconciler.Reconcile(context.TODO(), request)
+				Expect(err).To(BeNil())
+			})
+
+			It("should finish reconciling with an error when looking up the build fails with an unexpected error", func() {
+				client.GetCalls(func(_ context.Context, nn types.NamespacedName, o crc.Object, getOptions ...crc.GetOption) error {
+					return errors.NewBadRequest("foobar")
+				})
+
+				_, err := reconciler.Reconcile(context.TODO(), request)
+				Expect(err).ToNot(BeNil())
+			})
+		})
+
+		Context("when build object has output timestamp defined", func() {
+			It("should fail build validation due to unsupported combination of empty source with output image timestamp set to be the source timestamp", func() {
+				buildSample.Spec.Output.Timestamp = ptr.To(buildapi.OutputImageSourceTimestamp)
+				buildSample.Spec.Output.PushSecret = nil
+				buildSample.Spec.Source = &buildapi.Source{}
+
+				statusWriter.UpdateCalls(func(ctx context.Context, o crc.Object, sruo ...crc.SubResourceUpdateOption) error {
+					Expect(o).To(BeAssignableToTypeOf(&buildapi.Build{}))
+					b := o.(*buildapi.Build)
+					Expect(*b.Status.Reason).To(BeEquivalentTo(buildapi.OutputTimestampNotSupported))
+					Expect(*b.Status.Message).To(BeEquivalentTo("cannot use SourceTimestamp output image setting with an empty build source"))
+
+					return nil
+				})
+
+				_, err := reconciler.Reconcile(context.TODO(), request)
+				Expect(err).ToNot(HaveOccurred())
+			})
+
+			It("should fail when the output timestamp is not a parsable number", func() {
+				buildSample.Spec.Output.Timestamp = ptr.To("forty-two")
+				buildSample.Spec.Output.PushSecret = nil
+
+				statusWriter.UpdateCalls(func(ctx context.Context, o crc.Object, sruo ...crc.SubResourceUpdateOption) error {
+					Expect(o).To(BeAssignableToTypeOf(&buildapi.Build{}))
+					b := o.(*buildapi.Build)
+					Expect(*b.Status.Reason).To(BeEquivalentTo(buildapi.OutputTimestampNotValid))
+					Expect(*b.Status.Message).To(BeEquivalentTo("output timestamp value is invalid, must be Zero, SourceTimestamp, BuildTimestamp, or number"))
+
+					return nil
+				})
+
+				_, err := reconciler.Reconcile(context.TODO(), request)
+				Expect(err).ToNot(HaveOccurred())
+			})
+		})
+
+		Context("when nodeSelector is specified", func() {
+			It("should fail to validate when the nodeSelector is invalid", func() {
+				// set nodeSelector to be invalid
+				buildSample.Spec.NodeSelector = map[string]string{strings.Repeat("s", 64): "amd64"}
+				buildSample.Spec.Output.PushSecret = nil
+
+				statusCall := ctl.StubFunc(corev1.ConditionFalse, buildapi.NodeSelectorNotValid, "Node selector key not valid: name part must be no more than 63 bytes")
+				statusWriter.UpdateCalls(statusCall)
+
+				_, err := reconciler.Reconcile(context.TODO(), request)
+				Expect(err).To(BeNil())
+				Expect(statusWriter.UpdateCallCount()).To(Equal(1))
+			})
+		})
+
+		Context("when Tolerations is specified", func() {
+			It("should fail to validate when the Toleration is invalid", func() {
+				// set Toleration to be invalid
+				buildSample.Spec.Tolerations = []corev1.Toleration{{Key: strings.Repeat("s", 64), Operator: "Equal", Value: "test-value"}}
+				buildSample.Spec.Output.PushSecret = nil
+
+				statusCall := ctl.StubFunc(corev1.ConditionFalse, buildapi.TolerationNotValid, "Toleration key not valid: name part must be no more than 63 bytes")
+				statusWriter.UpdateCalls(statusCall)
+
+				_, err := reconciler.Reconcile(context.TODO(), request)
+				Expect(err).To(BeNil())
+				Expect(statusWriter.UpdateCallCount()).To(Equal(1))
+			})
+		})
+
+		Context("when SchedulerName is specified", func() {
+			It("should fail to validate when the SchedulerName is invalid", func() {
+				// set SchedulerName to be invalid
+				buildSample.Spec.SchedulerName = ptr.To(strings.Repeat("s", 64))
+				buildSample.Spec.Output.PushSecret = nil
+
+				statusCall := ctl.StubFunc(corev1.ConditionFalse, buildapi.SchedulerNameNotValid, "Scheduler name not valid: name part must be no more than 63 bytes")
+				statusWriter.UpdateCalls(statusCall)
+
+				_, err := reconciler.Reconcile(context.TODO(), request)
+				Expect(err).To(BeNil())
+				Expect(statusWriter.UpdateCallCount()).To(Equal(1))
 			})
 		})
 	})

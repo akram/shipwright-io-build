@@ -19,7 +19,7 @@ type rpSession struct {
 	*session
 }
 
-func newReceivePackSession(c *http.Client, ep *transport.Endpoint, auth transport.AuthMethod) (transport.ReceivePackSession, error) {
+func newReceivePackSession(c *client, ep *transport.Endpoint, auth transport.AuthMethod) (transport.ReceivePackSession, error) {
 	s, err := newSession(c, ep, auth)
 	return &rpSession{s}, err
 }
@@ -88,7 +88,7 @@ func (s *rpSession) doRequest(
 		body = content
 	}
 
-	req, err := http.NewRequest(method, url, body)
+	req, err := newRequest(method, url, body)
 	if err != nil {
 		return nil, plumbing.NewPermanentError(err)
 	}
@@ -102,7 +102,6 @@ func (s *rpSession) doRequest(
 	}
 
 	if err := NewErr(res); err != nil {
-		_ = res.Body.Close()
 		return nil, err
 	}
 

@@ -27,7 +27,7 @@ func Rebase(orig, oldBase, newBase v1.Image) (v1.Image, error) {
 	// not based on oldBase at all.
 	origLayers, err := orig.Layers()
 	if err != nil {
-		return nil, fmt.Errorf("failed to get layers for original: %v", err)
+		return nil, fmt.Errorf("failed to get layers for original: %w", err)
 	}
 	oldBaseLayers, err := oldBase.Layers()
 	if err != nil {
@@ -39,11 +39,11 @@ func Rebase(orig, oldBase, newBase v1.Image) (v1.Image, error) {
 	for i, l := range oldBaseLayers {
 		oldLayerDigest, err := l.Digest()
 		if err != nil {
-			return nil, fmt.Errorf("failed to get digest of layer %d of %q: %v", i, oldBase, err)
+			return nil, fmt.Errorf("failed to get digest of layer %d of %q: %w", i, oldBase, err)
 		}
 		origLayerDigest, err := origLayers[i].Digest()
 		if err != nil {
-			return nil, fmt.Errorf("failed to get digest of layer %d of %q: %v", i, orig, err)
+			return nil, fmt.Errorf("failed to get digest of layer %d of %q: %w", i, orig, err)
 		}
 		if oldLayerDigest != origLayerDigest {
 			return nil, fmt.Errorf("image %q is not based on %q (layer %d mismatch)", orig, oldBase, i)
@@ -52,17 +52,17 @@ func Rebase(orig, oldBase, newBase v1.Image) (v1.Image, error) {
 
 	oldConfig, err := oldBase.ConfigFile()
 	if err != nil {
-		return nil, fmt.Errorf("failed to get config for old base: %v", err)
+		return nil, fmt.Errorf("failed to get config for old base: %w", err)
 	}
 
 	origConfig, err := orig.ConfigFile()
 	if err != nil {
-		return nil, fmt.Errorf("failed to get config for original: %v", err)
+		return nil, fmt.Errorf("failed to get config for original: %w", err)
 	}
 
 	newConfig, err := newBase.ConfigFile()
 	if err != nil {
-		return nil, fmt.Errorf("could not get config for new base: %v", err)
+		return nil, fmt.Errorf("could not get config for new base: %w", err)
 	}
 
 	// Stitch together an image that contains:
@@ -72,13 +72,13 @@ func Rebase(orig, oldBase, newBase v1.Image) (v1.Image, error) {
 	// - new base image's history + top of original image's history
 	rebasedImage, err := Config(empty.Image, *origConfig.Config.DeepCopy())
 	if err != nil {
-		return nil, fmt.Errorf("failed to create empty image with original config: %v", err)
+		return nil, fmt.Errorf("failed to create empty image with original config: %w", err)
 	}
 
 	// Add new config properties from existing images.
 	rebasedConfig, err := rebasedImage.ConfigFile()
 	if err != nil {
-		return nil, fmt.Errorf("could not get config for rebased image: %v", err)
+		return nil, fmt.Errorf("could not get config for rebased image: %w", err)
 	}
 	// OS/Arch properties from new base
 	rebasedConfig.Architecture = newConfig.Architecture
@@ -88,24 +88,32 @@ func Rebase(orig, oldBase, newBase v1.Image) (v1.Image, error) {
 	// Apply config properties to rebased.
 	rebasedImage, err = ConfigFile(rebasedImage, rebasedConfig)
 	if err != nil {
-		return nil, fmt.Errorf("failed to replace config for rebased image: %v", err)
+		return nil, fmt.Errorf("failed to replace config for rebased image: %w", err)
 	}
 
 	// Get new base layers and config for history.
 	newBaseLayers, err := newBase.Layers()
 	if err != nil {
-		return nil, fmt.Errorf("could not get new base layers for new base: %v", err)
+		return nil, fmt.Errorf("could not get new base layers for new base: %w", err)
 	}
 	// Add new base layers.
-	rebasedImage, err = Append(rebasedImage, createAddendums(0, 0, newConfig.History, newBaseLayers)...)
+	newBaseAdds, err := createAddendums(0, 0, newConfig.History, newBaseLayers)
 	if err != nil {
-		return nil, fmt.Errorf("failed to append new base image: %v", err)
+		return nil, fmt.Errorf("failed to process new base image: %w", err)
+	}
+	rebasedImage, err = Append(rebasedImage, newBaseAdds...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to append new base image: %w", err)
 	}
 
 	// Add original layers above the old base.
-	rebasedImage, err = Append(rebasedImage, createAddendums(len(oldConfig.History), len(oldBaseLayers)+1, origConfig.History, origLayers)...)
+	origAdds, err := createAddendums(len(oldConfig.History), len(oldBaseLayers)+1, origConfig.History, origLayers)
 	if err != nil {
-		return nil, fmt.Errorf("failed to append original image: %v", err)
+		return nil, fmt.Errorf("failed to process original image: %w", err)
+	}
+	rebasedImage, err = Append(rebasedImage, origAdds...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to append original image: %w", err)
 	}
 
 	return rebasedImage, nil
@@ -113,7 +121,7 @@ func Rebase(orig, oldBase, newBase v1.Image) (v1.Image, error) {
 
 // createAddendums makes a list of addendums from a history and layers starting from a specific history and layer
 // indexes.
-func createAddendums(startHistory, startLayer int, history []v1.History, layers []v1.Layer) []Addendum {
+func createAddendums(startHistory, startLayer int, history []v1.History, layers []v1.Layer) ([]Addendum, error) {
 	var adds []Addendum
 	// History should be a superset of layers; empty layers (e.g. ENV statements) only exist in history.
 	// They cannot be iterated identically but must be walked independently, only advancing the iterator for layers
@@ -123,6 +131,9 @@ func createAddendums(startHistory, startLayer int, history []v1.History, layers 
 		var layer v1.Layer
 		emptyLayer := history[historyIndex].EmptyLayer
 		if !emptyLayer {
+			if layerIndex >= len(layers) {
+				return nil, fmt.Errorf("malformed image: config history references at least %d non-empty layer(s), but only %d layer(s) are present", layerIndex+1, len(layers))
+			}
 			layer = layers[layerIndex]
 			layerIndex++
 		}
@@ -136,9 +147,9 @@ func createAddendums(startHistory, startLayer int, history []v1.History, layers 
 	// In the event history was malformed or non-existent, append the remaining layers.
 	for i := layerIndex; i < len(layers); i++ {
 		if i >= startLayer {
-			adds = append(adds, Addendum{Layer: layers[layerIndex]})
+			adds = append(adds, Addendum{Layer: layers[i]})
 		}
 	}
 
-	return adds
+	return adds, nil
 }

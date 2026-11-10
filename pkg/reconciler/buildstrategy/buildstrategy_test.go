@@ -7,15 +7,13 @@ package buildstrategy_test
 import (
 	"context"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"github.com/shipwright-io/build/pkg/config"
 	"github.com/shipwright-io/build/pkg/controller/fakes"
-	"github.com/shipwright-io/build/pkg/ctxlog"
 	"github.com/shipwright-io/build/pkg/reconciler/buildstrategy"
 )
 
@@ -33,19 +31,20 @@ var _ = Describe("Reconcile BuildStrategy", func() {
 
 		// Fake the manager and get a reconcile Request
 		manager = &fakes.FakeManager{}
+		client := &fakes.FakeClient{}
+		manager.GetClientReturns(client)
 		request = reconcile.Request{NamespacedName: types.NamespacedName{Name: buildStrategyName, Namespace: namespace}}
 	})
 
 	JustBeforeEach(func() {
 		// Reconcile
-		testCtx := ctxlog.NewContext(context.TODO(), "fake-logger")
-		reconciler = buildstrategy.NewReconciler(testCtx, config.NewDefaultConfig(), manager)
+		reconciler = buildstrategy.NewReconciler(config.NewDefaultConfig(), manager)
 	})
 
 	Describe("Reconcile", func() {
 		Context("when request a new BuildStrategy", func() {
 			It("succeed without any error", func() {
-				result, err := reconciler.Reconcile(request)
+				result, err := reconciler.Reconcile(context.TODO(), request)
 				Expect(err).ToNot(HaveOccurred())
 				Expect(reconcile.Result{}).To(Equal(result))
 			})

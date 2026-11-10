@@ -7,16 +7,17 @@ package resources_test
 import (
 	"context"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	buildv1alpha1 "github.com/shipwright-io/build/pkg/apis/build/v1alpha1"
-	"github.com/shipwright-io/build/pkg/controller/fakes"
-	"github.com/shipwright-io/build/pkg/reconciler/buildrun/resources"
-	"github.com/shipwright-io/build/test"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	crc "sigs.k8s.io/controller-runtime/pkg/client"
+
+	buildapi "github.com/shipwright-io/build/pkg/apis/build/v1beta1"
+	"github.com/shipwright-io/build/pkg/controller/fakes"
+	"github.com/shipwright-io/build/pkg/reconciler/buildrun/resources"
+	test "github.com/shipwright-io/build/test/v1beta1_samples"
 )
 
 var _ = Describe("Operating Build strategies", func() {
@@ -30,11 +31,10 @@ var _ = Describe("Operating Build strategies", func() {
 		buildSample := ctl.BuildWithBuildStrategy("foobuild", "foostrategy", "foostrategy")
 
 		It("should return a cluster buildstrategy", func() {
-
 			// stub a GET API call with a cluster strategy
-			getClientStub := func(context context.Context, nn types.NamespacedName, object runtime.Object) error {
+			getClientStub := func(_ context.Context, nn types.NamespacedName, object crc.Object, _ ...crc.GetOption) error {
 				switch object := object.(type) {
-				case *buildv1alpha1.ClusterBuildStrategy:
+				case *buildapi.ClusterBuildStrategy:
 					ctl.DefaultClusterBuildStrategy().DeepCopyInto(object)
 					return nil
 				}
@@ -49,11 +49,10 @@ var _ = Describe("Operating Build strategies", func() {
 		})
 
 		It("should return a namespaced buildstrategy", func() {
-
 			// stub a GET API call with a namespace strategy
-			getClientStub := func(context context.Context, nn types.NamespacedName, object runtime.Object) error {
+			getClientStub := func(_ context.Context, nn types.NamespacedName, object crc.Object, _ ...crc.GetOption) error {
 				switch object := object.(type) {
-				case *buildv1alpha1.BuildStrategy:
+				case *buildapi.BuildStrategy:
 					ctl.DefaultNamespacedBuildStrategy().DeepCopyInto(object)
 					return nil
 				}

@@ -21,7 +21,7 @@ $ REGISTRY_SERVER=https://index.docker.io/v1/ REGISTRY_USER=<your_registry_user>
 $ kubectl create secret docker-registry tutorial-secret --docker-server=$REGISTRY_SERVER --docker-username=$REGISTRY_USER --docker-password=$REGISTRY_PASSWORD  --docker-email=me@here.com
 ```
 
-_Note_: For more information about authentication, please refer to the related [docs](/docs/development/authentication.md).
+_Note_: For more information about authentication, please refer to the related [docs](../development/authentication.md).
 
 ## Create the strategy
 
@@ -37,7 +37,7 @@ ko                2m
 source-to-image   2m
 ```
 
-_Note_: For more information about strategies, please refer to the related [docs](/docs/buildstrategies.md).
+_Note_: For more information about strategies, please refer to the related [docs](../buildstrategies.md).
 
 ## Creating a Build
 
@@ -52,21 +52,22 @@ Let's apply our Build and wait for it to be ready:
 ```bash
 $ export REGISTRY_ORG=<your_registry_org>
 $ cat <<EOF | kubectl apply -f -
-apiVersion: shipwright.io/v1alpha1
+apiVersion: shipwright.io/v1beta1
 kind: Build
 metadata:
   name: go-tutorial
 spec:
   source:
-    url: https://github.com/shipwright-io/sample-go
+    type: Git
+    git:
+      url: https://github.com/shipwright-io/sample-go
     contextDir: docker-build
   strategy:
     name: kaniko
     kind: ClusterBuildStrategy
   output:
     image: docker.io/${REGISTRY_ORG}/go-tutorial:latest
-    credentials:
-      name: tutorial-secret
+    pushSecret: tutorial-secret
 EOF
 ```
 
@@ -78,7 +79,7 @@ NAME          REGISTERED   REASON      BUILDSTRATEGYKIND      BUILDSTRATEGYNAME 
 go-tutorial   True         Succeeded   ClusterBuildStrategy   kaniko              13s
 ```
 
-_Note_: For more information about Build resources, please refer to the related [docs](/docs/build.md).
+_Note_: For more information about Build resources, please refer to the related [docs](../build.md).
 
 ## Creating a BuildRun
 
@@ -86,12 +87,12 @@ Second, we will create a `BuildRun` resource that references our previous `go-tu
 
 ```sh
 $ cat <<EOF | kubectl create -f -
-apiVersion: shipwright.io/v1alpha1
+apiVersion: shipwright.io/v1beta1
 kind: BuildRun
 metadata:
   name: go-tutorial-buildrun
 spec:
-  buildRef:
+  build:
     name: go-tutorial
 EOF
 ```
@@ -104,7 +105,7 @@ NAME                         SUCCEEDED   REASON      STARTTIME   COMPLETIONTIME
 go-tutorial-buildrun         True        Succeeded   2m45s       35s
 ```
 
-To know more about the state of the BuildRun, the `.Status.Conditions` fields provide more data:
+To know more about the state of the BuildRun, the `.status.conditions` fields provide more data:
 
 ```sh
 kubectl get buildrun go-tutorial-buildrun -o json | jq '.status.conditions[]'
@@ -120,7 +121,7 @@ kubectl get buildrun go-tutorial-buildrun -o json | jq '.status.conditions[]'
 _Note_: A BuildRun is a resource that runs to completion. The `REASON` column reflects the state of the resource. If the BuildRun ran to completion successfully,
 a `Succeeded` `REASON` is expected.
 
-_Note_: For more information about BuildRun resources, please refer to the related [docs](/docs/buildrun.md).
+_Note_: For more information about BuildRun resources, please refer to the related [docs](../buildrun.md).
 
 ## Closing
 

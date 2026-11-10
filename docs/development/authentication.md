@@ -9,10 +9,10 @@ SPDX-License-Identifier: Apache-2.0
 The following document provides an introduction around the different authentication methods that can take place during an image build when using the Build controller.
 
 - [Overview](#overview)
-- [Build Secrets Annotation](#build-secrets-annotation)
+
 - [Authentication for Git](#authentication-for-git)
-  - [Basic authentication](#basic-authentication)
   - [SSH authentication](#ssh-authentication)
+  - [Basic authentication](#basic-authentication)
   - [Usage of git secret](#usage-of-git-secret)
 - [Authentication to container registries](#authentication-to-container-registries)
   - [Docker Hub](#docker-hub)
@@ -21,32 +21,8 @@ The following document provides an introduction around the different authenticat
 
 ## Overview
 
-There are two places where users might need to define authentication when building images. Authentication to a container registry is the most common one, but also users might have the need to define authentications for pulling source-code from Git. Overall, the authentication is done via the definition of [secrets](https://kubernetes.io/docs/concepts/configuration/secret/) in which the require sensitive data will be stored.
+There are two places where users might need to define authentication when building images. Authentication to a container registry is the most common one, but also users might have the need to define authentications for pulling source-code from Git. Overall, the authentication is done via the definition of [secrets](https://kubernetes.io/docs/concepts/configuration/secret/) in which the required sensitive data will be stored.
 
-## Build Secrets Annotation
-
-Users need to add an annotation `build.shipwright.io/referenced.secret: "true"` to a build secret so that build controller can decide to take a reconcile action when a secret event (`create`, `update` and `delete`) happens. Below is a secret example with build annotation:
-
-```yaml
-apiVersion: v1
-data:
-  .dockerconfigjson: xxxxx
-kind: Secret
-metadata:
-  annotations:
-    build.shipwright.io/referenced.secret: "true"
-  name: secret-docker
-type: kubernetes.io/dockerconfigjson
-```
-
-This annotation will help us filter secrets which are not referenced on a Build instance. That means if a secret doesn't have this annotation, then although event happens on this secret, Build controller will not reconcile. Being able to reconcile on secrets events allow the Build controller to re-trigger validations on the Build configuration, allowing users to understand if a dependency is missing.
-
-If you are using `kubectl` command create secrets, then you can first create build secret using `kubectl create secret` command and annotate this secret using `kubectl annotate secrets`. Below is an example:
-
-```sh
-kubectl -n ${namespace} create secret docker-registry example-secret --docker-server=${docker-server} --docker-username="${username}" --docker-password="${password}" --docker-email=me@here.com
-kubectl -n ${namespace} annotate secrets example-secret build.shipwright.io/referenced.secret='true'
-```
 
 ## Authentication for Git
 
@@ -66,8 +42,6 @@ apiVersion: v1
 kind: Secret
 metadata:
   name: secret-git-ssh-auth
-  annotations:
-    build.shipwright.io/referenced.secret: "true"
 type: kubernetes.io/ssh-auth
 data:
   ssh-privatekey: <base64 <~/.ssh/id_rsa>
@@ -78,19 +52,20 @@ data:
 The Basic authentication is very similar to the ssh one, but with the following differences:
 
 - The Kubernetes secret should be of the type `kubernetes.io/basic-auth`
-- The `stringData` should host your user and password in clear text.
+- The `stringData` should host your user and personal access token in clear text.
+
+Note: GitHub and GitLab no longer accept account passwords when authenticating Git operations.
+Instead, you must use token-based authentication for all authenticated Git operations. You can create your own personal access token on [GitHub](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/creating-a-personal-access-token) and [GitLab](https://docs.gitlab.com/ee/user/profile/personal_access_tokens.html).
 
 ```yaml
 apiVersion: v1
 kind: Secret
 metadata:
   name: secret-git-basic-auth
-  annotations:
-    build.shipwright.io/referenced.secret: "true"
 type: kubernetes.io/basic-auth
 stringData:
   username: <cleartext username>
-  password: <cleartext password>
+  password: <cleartext token>
 ```
 
 ### Usage of git secret
@@ -102,29 +77,29 @@ Depending on the secret type, there are two ways of doing this:
 When using ssh auth, users should follow:
 
 ```yaml
-apiVersion: shipwright.io/v1alpha1
+apiVersion: shipwright.io/v1beta1
 kind: Build
 metadata:
   name: buildah-golang-build
 spec:
   source:
-    url: git@gitlab.com:eduardooli/newtaxi.git
-    credentials:
-      name: secret-git-ssh-auth
+    git:
+      url: git@gitlab.com:eduardooli/newtaxi.git
+      cloneSecret: secret-git-ssh-auth
 ```
 
 When using basic auth, users should follow:
 
 ```yaml
-apiVersion: shipwright.io/v1alpha1
+apiVersion: shipwright.io/v1beta1
 kind: Build
 metadata:
   name: buildah-golang-build
 spec:
   source:
-    url: https://gitlab.com/eduardooli/newtaxi.git
-    credentials:
-      name: secret-git-basic-auth
+    git:
+      url: https://gitlab.com/eduardooli/newtaxi.git
+      cloneSecret: secret-git-basic-auth
 ```
 
 ## Authentication to container registries
@@ -141,7 +116,6 @@ kubectl --namespace <YOUR_NAMESPACE> create secret docker-registry <CONTAINER_RE
   --docker-username=<USERNAME> \
   --docker-password=<PASSWORD> \
   --docker-email=me@here.com
-kubectl --namespace <YOUR_NAMESPACE> annotate secrets <CONTAINER_REGISTRY_SECRET_NAME> build.shipwright.io/referenced.secret='true'
 ```
 
 _Notes:_ When generating a secret to access docker hub, the `REGISTRY_HOST` value should be `https://index.docker.io/v1/`, the username is the Docker ID.
@@ -150,18 +124,17 @@ _Notes:_ The value of `PASSWORD` can be your user docker hub password, or an acc
 ### Usage of registry secret
 
 With the right secret in place (_note: Ensure creation of secret in the proper Kubernetes namespace_), users should reference it on their Build YAML definitions.
-For container registries, the secret should be placed under the `spec.output.credentials` path.
+For container registries, the secret should be placed under the `spec.output.pushSecret` path.
 
 ```yaml
-apiVersion: shipwright.io/v1alpha1
+apiVersion: shipwright.io/v1beta1
 kind: Build
 metadata:
   name: buildah-golang-build
   ...
   output:
     image: docker.io/foobar/sample:latest
-    credentials:
-      name: <CONTAINER_REGISTRY_SECRET_NAME>
+    pushSecret: <CONTAINER_REGISTRY_SECRET_NAME>
 ```
 
 ## References

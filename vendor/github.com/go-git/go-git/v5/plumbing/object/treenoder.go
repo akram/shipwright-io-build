@@ -38,6 +38,10 @@ func NewTreeRootNode(t *Tree) noder.Noder {
 	}
 }
 
+func (t *treeNoder) Skip() bool {
+	return false
+}
+
 func (t *treeNoder) isRoot() bool {
 	return t.name == ""
 }
@@ -84,7 +88,9 @@ func (t *treeNoder) Children() ([]noder.Noder, error) {
 		}
 	}
 
-	return transformChildren(parent)
+	var err error
+	t.children, err = transformChildren(parent)
+	return t.children, err
 }
 
 // Returns the children of a tree as treenoders.
@@ -100,6 +106,12 @@ func transformChildren(t *Tree) ([]noder.Noder, error) {
 	ret := make([]noder.Noder, 0, len(t.Entries))
 
 	walker := NewTreeWalker(t, false, nil) // don't recurse
+	// The diff walk is read-only and never materialises entry names into the
+	// filesystem, so it must enumerate the tree faithfully — including entries
+	// with names that are unsafe to check out but valid per upstream Git (e.g.
+	// control characters). Path safety is enforced at materialisation
+	// boundaries (FindEntry, TreeEntryFile, archive, FileIter), not here.
+	walker.SkipPathValidation()
 	// don't defer walker.Close() for efficiency reasons.
 	for {
 		_, e, err = walker.Next()

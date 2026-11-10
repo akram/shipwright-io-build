@@ -80,6 +80,16 @@ func (s ClusterBuildStrategy) GetParameters() []Parameter {
 	return s.Spec.Parameters
 }
 
+// GetSecurityContext returns the security context defined by the build strategy
+func (s ClusterBuildStrategy) GetSecurityContext() *BuildStrategySecurityContext {
+	return s.Spec.SecurityContext
+}
+
+// GetVolumes returns the volumes defined by the build strategy
+func (s ClusterBuildStrategy) GetVolumes() []BuildStrategyVolume {
+	return s.Spec.Volumes
+}
+
 func init() {
 	SchemeBuilder.Register(&ClusterBuildStrategy{}, &ClusterBuildStrategyList{})
 }

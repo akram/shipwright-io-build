@@ -12,7 +12,6 @@ import (
 	v1alpha1 "github.com/shipwright-io/build/pkg/apis/build/v1alpha1"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	labels "k8s.io/apimachinery/pkg/labels"
-	schema "k8s.io/apimachinery/pkg/runtime/schema"
 	types "k8s.io/apimachinery/pkg/types"
 	watch "k8s.io/apimachinery/pkg/watch"
 	testing "k8s.io/client-go/testing"
@@ -23,9 +22,9 @@ type FakeClusterBuildStrategies struct {
 	Fake *FakeShipwrightV1alpha1
 }
 
-var clusterbuildstrategiesResource = schema.GroupVersionResource{Group: "shipwright.io", Version: "v1alpha1", Resource: "clusterbuildstrategies"}
+var clusterbuildstrategiesResource = v1alpha1.SchemeGroupVersion.WithResource("clusterbuildstrategies")
 
-var clusterbuildstrategiesKind = schema.GroupVersionKind{Group: "shipwright.io", Version: "v1alpha1", Kind: "ClusterBuildStrategy"}
+var clusterbuildstrategiesKind = v1alpha1.SchemeGroupVersion.WithKind("ClusterBuildStrategy")
 
 // Get takes name of the clusterBuildStrategy, and returns the corresponding clusterBuildStrategy object, and an error if there is any.
 func (c *FakeClusterBuildStrategies) Get(ctx context.Context, name string, options v1.GetOptions) (result *v1alpha1.ClusterBuildStrategy, err error) {
@@ -98,7 +97,7 @@ func (c *FakeClusterBuildStrategies) UpdateStatus(ctx context.Context, clusterBu
 // Delete takes name of the clusterBuildStrategy and deletes it. Returns an error if one occurs.
 func (c *FakeClusterBuildStrategies) Delete(ctx context.Context, name string, opts v1.DeleteOptions) error {
 	_, err := c.Fake.
-		Invokes(testing.NewRootDeleteAction(clusterbuildstrategiesResource, name), &v1alpha1.ClusterBuildStrategy{})
+		Invokes(testing.NewRootDeleteActionWithOptions(clusterbuildstrategiesResource, name, opts), &v1alpha1.ClusterBuildStrategy{})
 	return err
 }
 

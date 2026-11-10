@@ -8,13 +8,14 @@ import (
 	"os"
 	"time"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
-	"k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
 
 	. "github.com/shipwright-io/build/pkg/config"
+	"github.com/shipwright-io/build/pkg/env"
 )
 
 var _ = Describe("Config", func() {
@@ -107,7 +108,7 @@ var _ = Describe("Config", func() {
 			}
 
 			configWithEnvVariableOverrides(overrides, func(config *Config) {
-				Expect(config.GitContainerTemplate).To(Equal(corev1.Container{
+				Expect(config.GitContainerTemplate).To(Equal(Step{
 					Image: "myregistry/custom/git-image",
 					Resources: corev1.ResourceRequirements{
 						Requests: corev1.ResourceList{
@@ -125,15 +126,26 @@ var _ = Describe("Config", func() {
 			}
 
 			configWithEnvVariableOverrides(overrides, func(config *Config) {
-				nonRoot := pointer.Int64Ptr(1000)
-				Expect(config.GitContainerTemplate).To(Equal(corev1.Container{
+				nonRoot := ptr.To[int64](1000)
+				Expect(config.GitContainerTemplate).To(Equal(Step{
 					Image: "myregistry/custom/git-image",
 					Command: []string{
 						"/ko-app/git",
 					},
+					Env: []corev1.EnvVar{
+						{Name: "HOME", Value: "/shared-home"},
+						{Name: "GIT_SHOW_LISTING", Value: "false"},
+					},
 					SecurityContext: &corev1.SecurityContext{
-						RunAsUser:  nonRoot,
-						RunAsGroup: nonRoot,
+						AllowPrivilegeEscalation: ptr.To(false),
+						Capabilities: &corev1.Capabilities{
+							Drop: []corev1.Capability{
+								"ALL",
+							},
+						},
+						RunAsUser:              nonRoot,
+						RunAsGroup:             nonRoot,
+						ReadOnlyRootFilesystem: ptr.To(true),
 					},
 				}))
 			})
@@ -146,7 +158,7 @@ var _ = Describe("Config", func() {
 			}
 
 			configWithEnvVariableOverrides(overrides, func(config *Config) {
-				Expect(config.GitContainerTemplate).To(Equal(corev1.Container{
+				Expect(config.GitContainerTemplate).To(Equal(Step{
 					Image: "myregistry/custom/git-image:override",
 					Resources: corev1.ResourceRequirements{
 						Requests: corev1.ResourceList{
@@ -155,6 +167,133 @@ var _ = Describe("Config", func() {
 						},
 					},
 				}))
+			})
+		})
+
+		It("should allow for an override of the image processing container template", func() {
+			overrides := map[string]string{
+				"IMAGE_PROCESSING_CONTAINER_TEMPLATE": `{"image":"myregistry/custom/image-processing","resources":{"requests":{"cpu":"0.5","memory":"128Mi"}}}`,
+			}
+
+			configWithEnvVariableOverrides(overrides, func(config *Config) {
+				Expect(config.ImageProcessingContainerTemplate).To(Equal(Step{
+					Image: "myregistry/custom/image-processing",
+					Resources: corev1.ResourceRequirements{
+						Requests: corev1.ResourceList{
+							corev1.ResourceCPU:    resource.MustParse("0.5"),
+							corev1.ResourceMemory: resource.MustParse("128Mi"),
+						},
+					},
+				}))
+			})
+		})
+
+		It("should allow for an override of the Waiter container template", func() {
+			var overrides = map[string]string{
+				"WAITER_CONTAINER_TEMPLATE": `{"image":"myregistry/custom/image","resources":{"requests":{"cpu":"0.5","memory":"128Mi"}}}`,
+			}
+
+			configWithEnvVariableOverrides(overrides, func(config *Config) {
+				Expect(config.WaiterContainerTemplate).To(Equal(Step{
+					Image: "myregistry/custom/image",
+					Resources: corev1.ResourceRequirements{
+						Requests: corev1.ResourceList{
+							corev1.ResourceCPU:    resource.MustParse("0.5"),
+							corev1.ResourceMemory: resource.MustParse("128Mi"),
+						},
+					},
+				}))
+			})
+		})
+
+		It("should allow for an override of the image-processing container template and image", func() {
+			overrides := map[string]string{
+				"IMAGE_PROCESSING_CONTAINER_TEMPLATE": `{"image":"myregistry/custom/image-processing","resources":{"requests":{"cpu":"0.5","memory":"128Mi"}}}`,
+				"IMAGE_PROCESSING_CONTAINER_IMAGE":    "myregistry/custom/image-processing:override",
+			}
+
+			configWithEnvVariableOverrides(overrides, func(config *Config) {
+				Expect(config.ImageProcessingContainerTemplate).To(Equal(Step{
+					Image: "myregistry/custom/image-processing:override",
+					Resources: corev1.ResourceRequirements{
+						Requests: corev1.ResourceList{
+							corev1.ResourceCPU:    resource.MustParse("0.5"),
+							corev1.ResourceMemory: resource.MustParse("128Mi"),
+						},
+					},
+				}))
+			})
+
+		})
+
+		It("should allow for an override of the Waiter container image", func() {
+			var overrides = map[string]string{
+				"WAITER_CONTAINER_IMAGE": "myregistry/custom/image",
+			}
+
+			configWithEnvVariableOverrides(overrides, func(config *Config) {
+				nonRoot := ptr.To[int64](1000)
+				Expect(config.WaiterContainerTemplate).To(Equal(Step{
+					Image:   "myregistry/custom/image",
+					Command: []string{"/ko-app/waiter"},
+					Args:    []string{"start", "--lock-file=/shp-tmp/waiter.lock"},
+					Env:     []corev1.EnvVar{{Name: "HOME", Value: "/shared-home"}},
+					SecurityContext: &corev1.SecurityContext{
+						AllowPrivilegeEscalation: ptr.To(false),
+						Capabilities: &corev1.Capabilities{
+							Drop: []corev1.Capability{
+								"ALL",
+							},
+						},
+						RunAsUser:              nonRoot,
+						RunAsGroup:             nonRoot,
+						ReadOnlyRootFilesystem: ptr.To(true),
+					},
+				}))
+			})
+		})
+
+		It("should allow for an override of the Waiter container template and image", func() {
+			var overrides = map[string]string{
+				"WAITER_CONTAINER_TEMPLATE": `{"image":"myregistry/custom/image","resources":{"requests":{"cpu":"0.5","memory":"128Mi"}}}`,
+				"WAITER_CONTAINER_IMAGE":    "myregistry/custom/image:override",
+			}
+
+			configWithEnvVariableOverrides(overrides, func(config *Config) {
+				Expect(config.WaiterContainerTemplate).To(Equal(Step{
+					Image: "myregistry/custom/image:override",
+					Resources: corev1.ResourceRequirements{
+						Requests: corev1.ResourceList{
+							corev1.ResourceCPU:    resource.MustParse("0.5"),
+							corev1.ResourceMemory: resource.MustParse("128Mi"),
+						},
+					},
+				}))
+			})
+		})
+		It("should use default forbidden env var names when no override is set", func() {
+			config := NewDefaultConfig()
+			Expect(config.ForbiddenEnvVarNames).ToNot(BeEmpty())
+			Expect(config.ForbiddenEnvVarNames).To(ContainElement("LD_PRELOAD"))
+			Expect(config.ForbiddenEnvVarNames).To(ContainElement("LD_*"))
+		})
+
+		It("should allow for an override of the forbidden env var names using an environment variable", func() {
+			var overrides = map[string]string{"FORBIDDEN_ENV_VAR_NAMES": "CUSTOM_VAR,MALICIOUS_*"}
+			configWithEnvVariableOverrides(overrides, func(config *Config) {
+				Expect(config.ForbiddenEnvVarNames).To(Equal([]string{"CUSTOM_VAR", "MALICIOUS_*"}))
+				Expect(env.IsForbiddenEnvVar("CUSTOM_VAR")).To(BeTrue())
+				Expect(env.IsForbiddenEnvVar("MALICIOUS_INJECT")).To(BeTrue())
+				Expect(env.IsForbiddenEnvVar("LD_PRELOAD")).To(BeFalse())
+			})
+		})
+
+		It("should trim whitespace from entries in the forbidden env var names override", func() {
+			var overrides = map[string]string{"FORBIDDEN_ENV_VAR_NAMES": " CUSTOM_VAR , MALICIOUS_* "}
+			configWithEnvVariableOverrides(overrides, func(config *Config) {
+				Expect(config.ForbiddenEnvVarNames).To(Equal([]string{"CUSTOM_VAR", "MALICIOUS_*"}))
+				Expect(env.IsForbiddenEnvVar("CUSTOM_VAR")).To(BeTrue())
+				Expect(env.IsForbiddenEnvVar("MALICIOUS_INJECT")).To(BeTrue())
 			})
 		})
 	})
@@ -172,7 +311,7 @@ func configWithEnvVariableOverrides(settings map[string]string, f func(config *C
 			backup[k] = nil
 		}
 
-		os.Setenv(k, v)
+		Expect(os.Setenv(k, v)).To(Succeed())
 	}
 
 	config := NewDefaultConfig()
@@ -185,9 +324,9 @@ func configWithEnvVariableOverrides(settings map[string]string, f func(config *C
 
 	for k, v := range backup {
 		if v != nil {
-			os.Setenv(k, *v)
+			Expect(os.Setenv(k, *v)).To(Succeed())
 		} else {
-			os.Unsetenv(k)
+			Expect(os.Unsetenv(k)).To(Succeed())
 		}
 	}
 }

@@ -6,13 +6,13 @@ package git
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
+	gogitv5 "github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/config"
 	"github.com/go-git/go-git/v5/plumbing/transport"
 	"github.com/go-git/go-git/v5/storage/memory"
-
-	gogitv5 "github.com/go-git/go-git/v5"
 )
 
 const (
@@ -22,6 +22,32 @@ const (
 	fileProtocol  = "file"
 	gitProtocol   = "ssh"
 )
+
+// ExtractHostnamePort extracts the hostname and port of the provided Git URL
+func ExtractHostnamePort(url string) (string, int, error) {
+	endpoint, err := transport.NewEndpoint(url)
+	if err != nil {
+		return "", 0, err
+	}
+
+	port := endpoint.Port
+
+	if port == 0 {
+		switch endpoint.Protocol {
+		case httpProtocol:
+			port = 80
+		case httpsProtocol:
+			port = 443
+		case gitProtocol:
+			port = 22
+
+		default:
+			return "", 0, fmt.Errorf("unknown protocol: %s", endpoint.Protocol)
+		}
+	}
+
+	return endpoint.Host, port, nil
+}
 
 // ValidateGitURLExists validate if a source URL exists or not
 // Note: We have an upcoming PR for the Build Status, where we
@@ -45,7 +71,7 @@ func ValidateGitURLExists(ctx context.Context, urlPath string) error {
 			// path doesn't exist, func will return `authentication required`,
 			// this is maybe misleading. So convert this error message to:
 			// `remote repository unreachable`
-			if err == transport.ErrAuthenticationRequired {
+			if errors.Is(err, transport.ErrAuthenticationRequired) {
 				return fmt.Errorf("remote repository unreachable")
 			}
 

@@ -1,0 +1,203 @@
+#!/usr/bin/env bash
+# Copyright The Shipwright Contributors
+#
+# SPDX-License-Identifier: Apache-2.0
+
+set -euo pipefail
+
+# extract the images
+readarray -t images < <(grep ghcr.io "${RELEASE_YAML}" | sed -E 's/(image|value)://' | tr -d ' ' | sort -u)
+
+# capture whether vulnerabilities exist
+hasVulnerabilities=false
+allVulnerabilitiesFixedByRebuild=true
+
+# iterate the images
+true>/tmp/report.md
+for image in "${images[@]}"; do
+  echo "[INFO] Checking image ${image}"
+  echo "## ${image}" >>/tmp/report.md
+
+  # Rebuilding image to compare vulnerabilities
+  entrypoint="$(crane config "${image}" | jq -r '.config.Entrypoint[0]')"
+  binaryName="$(basename "${entrypoint}")"
+  echo "  [INFO] Rebuilding github.com/shipwright-io/build/cmd/${binaryName}"
+  pushd "${REPOSITORY}" >/dev/null
+    KO_DOCKER_REPO=dummy/image ko build "github.com/shipwright-io/build/cmd/${binaryName}" --bare --platform linux/amd64 --push=false --sbom none --tarball /tmp/new-image.tar
+  popd >/dev/null
+
+  # OS vulnerabilities (Grype)
+  echo "  [INFO] Checking for OS vulnerabilities using Grype"
+  echo "### OS vulnerabilities (Grype)" >>/tmp/report.md
+  osVulnsGrype="$(grype --output json --only-fixed --quiet "${image}")"
+  osVulnsGrypeFound=false
+  osVulnsGrypeLatest="$(grype --output json --only-fixed --quiet /tmp/new-image.tar)"
+  while read -r id pkg severity vulnerableVersion fixedVersion; do
+    if [ "${id}" == "" ]; then
+      continue
+    fi
+
+    # Check if it exists in the latest image
+    if [ "$(jq --raw-output ".matches[] | select(.artifact.type == \"rpm\" and .vulnerability.id == \"${id}\")" <<<"${osVulnsGrypeLatest}")" == "" ]; then
+      fixed=":white_check_mark:"
+      fixedSentence=" This vulnerability is fixed by a rebuild."
+    else
+      fixed=":x:"
+      fixedSentence=
+      allVulnerabilitiesFixedByRebuild=false
+    fi
+
+    if [ "${osVulnsGrypeFound}" == "false" ]; then
+      echo "| Vulnerability | Package | Severity | Version | Fixed by rebuild |" >>/tmp/report.md
+      echo "| -- | -- | -- | -- | -- |" >>/tmp/report.md
+      osVulnsGrypeFound=true
+      hasVulnerabilities=true
+    fi
+
+    severityLower="$(tr '[:upper:]' '[:lower:]' <<<"${severity}")"
+
+    echo "    [INFO] Found ${id} in ${pkg} with severity ${severityLower}. Requires upgrade from ${vulnerableVersion} to ${fixedVersion}.${fixedSentence}"
+    echo "| ${id} | ${pkg} | ${severityLower} | ${vulnerableVersion} -> ${fixedVersion} | ${fixed} |" >>/tmp/report.md
+  done <<<"$(jq --raw-output '.matches[] | select(.artifact.type == "rpm") | [ .vulnerability.id, .artifact.name, .vulnerability.severity, .artifact.version, .vulnerability.fix.versions[0] ] | @tsv' <<<"${osVulnsGrype}")"
+
+  if [ "${osVulnsGrypeFound}" == "false" ]; then
+    echo "    [INFO] No vulnerabilities found."
+    echo "No vulnerabilities found." >>/tmp/report.md
+  fi
+
+  # OS vulnerabilities (Trivy)
+  echo "  [INFO] Checking for OS vulnerabilities using Trivy"
+  echo "### OS vulnerabilities (Trivy)" >>/tmp/report.md
+  osVulnsTrivy="$(trivy image --disable-telemetry --skip-version-check --format json --ignore-unfixed --no-progress --pkg-types os --scanners vuln --skip-db-update --timeout 10m "${image}")"
+  osVulnsTrivyFound=false
+  osVulnsTrivyLatest="$(trivy image --disable-telemetry --skip-version-check --format json --ignore-unfixed --input /tmp/new-image.tar --no-progress --pkg-types os --scanners vuln --skip-db-update --timeout 10m)"
+  while read -r id pkg severity vulnerableVersion fixedVersion; do
+    if [ "${id}" == "" ]; then
+      continue
+    fi
+
+    # Check if it exists in the latest image
+    if [ "$(jq --raw-output "(.Results[0].Vulnerabilities // [])[] | select(.VulnerabilityID == \"${id}\")" <<<"${osVulnsTrivyLatest}")" == "" ]; then
+      fixed=":white_check_mark:"
+      fixedSentence=" This vulnerability is fixed by a rebuild."
+    else
+      fixed=":x:"
+      fixedSentence=
+      allVulnerabilitiesFixedByRebuild=false
+    fi
+
+    if [ "${osVulnsTrivyFound}" == "false" ]; then
+      echo "| Vulnerability | Package | Severity | Version | Fixed by rebuild |" >>/tmp/report.md
+      echo "| -- | -- | -- | -- | -- |" >>/tmp/report.md
+      osVulnsTrivyFound=true
+      hasVulnerabilities=true
+    fi
+
+    severityLower="$(tr '[:upper:]' '[:lower:]' <<<"${severity}")"
+
+    echo "    [INFO] Found ${id} in ${pkg} with severity ${severityLower}. Requires upgrade from ${vulnerableVersion} to ${fixedVersion}.${fixedSentence}"
+    echo "| ${id} | ${pkg} | ${severityLower} | ${vulnerableVersion} -> ${fixedVersion} | ${fixed} |" >>/tmp/report.md
+  done <<<"$(jq --raw-output '.Results[0].Vulnerabilities[] | [ .VulnerabilityID, .PkgName, .Severity, .InstalledVersion, .FixedVersion ] | @tsv' <<<"${osVulnsTrivy}")"
+
+  if [ "${osVulnsTrivyFound}" == "false" ]; then
+    echo "    [INFO] No vulnerabilities found."
+    echo "No vulnerabilities found." >>/tmp/report.md
+  fi
+
+  # Go vulnerabilities
+  echo "  [INFO] Checking for Go vulnerabilities"
+  echo "### Go vulnerabilities" >>/tmp/report.md
+  crane export "${image}" /tmp/old-image-export.tar
+  if ! tar -xf /tmp/old-image-export.tar -C /tmp "${entrypoint:1}"; then
+    tar -xf /tmp/old-image-export.tar -C /tmp "${entrypoint}"
+  fi
+  goVulns="$(govulncheck -format json -mode binary "/tmp${entrypoint}")"
+  goVulnsFound=false
+  crane export - /tmp/new-image-export.tar </tmp/new-image.tar
+  if ! tar -xf /tmp/new-image-export.tar -C /tmp "${entrypoint:1}"; then
+    tar -xf /tmp/new-image-export.tar -C /tmp "${entrypoint}"
+  fi
+  goVulnsLatest="$(govulncheck -format json -mode binary "/tmp${entrypoint}")"
+  rm -f /tmp/new-image.tar /tmp/new-image-export.tar /tmp/old-image-export.tar "/tmp${entrypoint}"
+  while read -r id pkg vulnerableVersion fixedVersion; do
+    if [ "${id}" == "" ]; then
+      continue
+    fi
+
+    # Check if it exists in the latest image
+    if [ "$(jq --raw-output "select(.finding.osv == \"${id}\")" <<<"${goVulnsLatest}")" == "" ]; then
+      fixed=":white_check_mark:"
+      fixedSentence=" This vulnerability is fixed by a rebuild."
+    else
+      fixed=":x:"
+      fixedSentence=
+      allVulnerabilitiesFixedByRebuild=false
+    fi
+
+    if [ "${goVulnsFound}" == "false" ]; then
+      echo "| Vulnerability | Package | Version | Fixed by rebuild |" >>/tmp/report.md
+      echo "| -- | -- | -- | -- |" >>/tmp/report.md
+      goVulnsFound=true
+      hasVulnerabilities=true
+    fi
+
+    echo "    [INFO] Found ${id} in ${pkg}. Requires upgrade from ${vulnerableVersion} to ${fixedVersion}.${fixedSentence}"
+    echo "| ${id} | [${pkg}](https://pkg.go.dev/${pkg}) | ${vulnerableVersion} -> ${fixedVersion} | ${fixed} |" >>/tmp/report.md
+  done <<<"$(jq --raw-output 'select(.finding != null and .finding.fixed_version != null) | [ .finding.osv, .finding.trace[0].module, .finding.trace[0].version, .finding.fixed_version ] | @tsv' <<<"${goVulns}" | sort -u)"
+
+  if [ "${goVulnsFound}" == "false" ]; then
+    echo "    [INFO] No vulnerabilities found."
+    echo "No vulnerabilities found." >>/tmp/report.md
+  fi
+done
+
+# check if issue exists, if yes, update description, otherwise create one, or close it if vulnerabilities are gone
+assignees="$(dyff json OWNERS | jq -r '.approvers | join(",")')"
+issues="$(gh issue list --label release-vulnerabilities --json number)"
+
+if [ "$(jq length <<<"${issues}")" == "0" ]; then
+  if [ "${hasVulnerabilities}" == "true" ]; then
+    # create new issue
+    echo "[INFO] Creating new issue"
+    gh issue create \
+      --assignee "${assignees}" \
+      --label release-vulnerabilities \
+      --title "Vulnerabilities found in latest release ${RELEASE_TAG}" \
+      --body-file /tmp/report.md | tee /tmp/gh_issue
+
+    issueIdentifier="$(</tmp/gh_issue)"
+  fi
+else
+  issueIdentifier="$(jq '.[0].number' <<<"${issues}")"
+  if [ "${hasVulnerabilities}" == "true" ]; then
+    # update issue
+    echo "[INFO] Updating existing issue ${issueIdentifier}"
+    gh issue edit "${issueIdentifier}" \
+      --add-assignee "${assignees}" \
+      --body-file /tmp/report.md
+  else
+    gh issue close "${issueIdentifier}" \
+      --comment  "No vulnerabilities found in the latest release ${RELEASE_TAG}" \
+      --reason completed
+  fi
+fi
+
+# Create release if all vulnerabilities are fixable by a rebuild
+if [ "${hasVulnerabilities}" == "true" ] && [ "${allVulnerabilitiesFixedByRebuild}" == "true" ]; then
+  nextTag="$(semver bump patch "${RELEASE_TAG}")"
+
+  # check if tag already exists
+  if gh release view "${nextTag}" >/dev/null 2>&1; then
+    echo "[INFO] There is already a new tag ${nextTag} which seemingly was not yet released by a maintainer"
+    gh issue comment "${issueIdentifier}" --body "All existing vulnerabilities in ${RELEASE_TAG} can be fixed by a rebuild, but such a rebuild seemingly already exists as ${nextTag}. A maintainer must release this."
+  else
+    echo "[INFO] Triggering build of release ${nextTag} for branch ${RELEASE_BRANCH}"
+    gh workflow run release.yaml \
+      --ref "${RELEASE_BRANCH}" \
+      --raw-field "git-ref=${RELEASE_BRANCH}" \
+      --raw-field "tags=${RELEASE_TAG}" \
+      --raw-field "release=${nextTag}"
+
+    gh issue comment "${issueIdentifier}" --body "Triggered a release build in branch ${RELEASE_BRANCH} for ${nextTag}. Please check whether this succeeded. A maintainer must release this."
+  fi
+fi

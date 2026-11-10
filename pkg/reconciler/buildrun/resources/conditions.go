@@ -7,113 +7,156 @@ package resources
 import (
 	"context"
 	"fmt"
-	"github.com/tektoncd/pipeline/pkg/apis/pipeline/v1beta1"
-	"knative.dev/pkg/apis"
-	"sigs.k8s.io/controller-runtime/pkg/client"
+	"time"
 
+	pipelineapi "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"knative.dev/pkg/apis"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	buildv1alpha1 "github.com/shipwright-io/build/pkg/apis/build/v1alpha1"
+	buildapi "github.com/shipwright-io/build/pkg/apis/build/v1beta1"
 	"github.com/shipwright-io/build/pkg/ctxlog"
 )
 
 // Common condition strings for reason, kind, etc.
 const (
-	ConditionUnknownStrategyKind     string = "UnknownStrategyKind"
-	ClusterBuildStrategyNotFound     string = "ClusterBuildStrategyNotFound"
-	BuildStrategyNotFound            string = "BuildStrategyNotFound"
-	ConditionSetOwnerReferenceFailed string = "SetOwnerReferenceFailed"
-	ConditionFailed                  string = "Failed"
-	ConditionTaskRunIsMissing        string = "TaskRunIsMissing"
-	ConditionTaskRunGenerationFailed string = "TaskRunGenerationFailed"
-	ConditionServiceAccountNotFound  string = "ServiceAccountNotFound"
-	ConditionBuildRegistrationFailed string = "BuildRegistrationFailed"
-	ConditionBuildNotFound           string = "BuildNotFound"
-	BuildRunNameInvalid              string = "BuildRunNameInvalid"
+	ConditionUnknownStrategyKind                     string = "UnknownStrategyKind"
+	ClusterBuildStrategyNotFound                     string = "ClusterBuildStrategyNotFound"
+	BuildStrategyNotFound                            string = "BuildStrategyNotFound"
+	ConditionSetOwnerReferenceFailed                 string = "SetOwnerReferenceFailed"
+	ConditionFailed                                  string = "Failed"
+	ConditionTaskRunIsMissing                        string = "TaskRunIsMissing"
+	ConditionTaskRunGenerationFailed                 string = "TaskRunGenerationFailed"
+	ConditionPipelineRunGenerationFailed             string = "PipelineRunGenerationFailed"
+	ConditionServiceAccountNotFound                  string = "ServiceAccountNotFound"
+	ConditionBuildRegistrationFailed                 string = "BuildRegistrationFailed"
+	ConditionBuildNotFound                           string = "BuildNotFound"
+	ConditionMissingParameterValues                  string = "MissingParameterValues"
+	ConditionRestrictedParametersInUse               string = "RestrictedParametersInUse"
+	ConditionUndefinedParameter                      string = "UndefinedParameter"
+	ConditionWrongParameterValueType                 string = "WrongParameterValueType"
+	ConditionInconsistentParameterValues             string = "InconsistentParameterValues"
+	ConditionEmptyArrayItemParameterValues           string = "EmptyArrayItemParameterValues"
+	ConditionIncompleteConfigMapValueParameterValues string = "IncompleteConfigMapValueParameterValues"
+	ConditionIncompleteSecretValueParameterValues    string = "IncompleteSecretValueParameterValues"
+	BuildRunNameInvalid                              string = "BuildRunNameInvalid"
+	BuildRunNoRefOrSpec                              string = "BuildRunNoRefOrSpec"
+	BuildRunAmbiguousBuild                           string = "BuildRunAmbiguousBuild"
+	BuildRunBuildFieldOverrideForbidden              string = "BuildRunBuildFieldOverrideForbidden"
 )
 
 // UpdateBuildRunUsingTaskRunCondition updates the BuildRun Succeeded Condition
-func UpdateBuildRunUsingTaskRunCondition(ctx context.Context, client client.Client, buildRun *buildv1alpha1.BuildRun, taskRun *v1beta1.TaskRun, trCondition *apis.Condition) error {
-	var reason, message string = trCondition.Reason, trCondition.Message
+func UpdateBuildRunUsingTaskRunCondition(ctx context.Context, client client.Client, buildRun *buildapi.BuildRun, taskRun *pipelineapi.TaskRun, trCondition *apis.Condition) error {
+	reason, message := trCondition.Reason, trCondition.Message
 	status := trCondition.Status
 
-	switch v1beta1.TaskRunReason(reason) {
-	case v1beta1.TaskRunReasonStarted:
+	switch pipelineapi.TaskRunReason(reason) {
+	case pipelineapi.TaskRunReasonStarted:
 		fallthrough
-	case v1beta1.TaskRunReasonRunning:
+	case pipelineapi.TaskRunReasonRunning:
 		if buildRun.IsCanceled() {
 			status = corev1.ConditionUnknown // in practice the taskrun status is already unknown in this case, but we are making sure here
-			reason = buildv1alpha1.BuildRunStateCancel
+			reason = buildapi.BuildRunStateCancel
 			message = "The user requested the BuildRun to be canceled.  This BuildRun controller has requested the TaskRun be canceled.  That request has not been process by Tekton's TaskRun controller yet."
 		}
-	case v1beta1.TaskRunReasonCancelled:
+	case pipelineapi.TaskRunReasonCancelled:
 		if buildRun.IsCanceled() {
 			status = corev1.ConditionFalse // in practice the taskrun status is already false in this case, bue we are making sure here
-			reason = buildv1alpha1.BuildRunStateCancel
+			reason = buildapi.BuildRunStateCancel
 			message = "The BuildRun and underlying TaskRun were canceled successfully."
 		}
 
-	case v1beta1.TaskRunReasonTimedOut:
+	case pipelineapi.TaskRunReasonTimedOut:
 		reason = "BuildRunTimeout"
+		var timeout time.Duration
+		if taskRun.Spec.Timeout == nil {
+			// if the TaskRun does not have a timeout set, we cannot use it to determine the BuildRun timeout
+			timeout = time.Since(taskRun.CreationTimestamp.Time)
+		} else {
+			timeout = taskRun.Spec.Timeout.Duration
+		}
 		message = fmt.Sprintf("BuildRun %s failed to finish within %s",
 			buildRun.Name,
-			taskRun.Spec.Timeout.Duration,
+			timeout,
 		)
 
-	case v1beta1.TaskRunReasonSuccessful:
+	case pipelineapi.TaskRunReasonSuccessful:
 		if buildRun.IsCanceled() {
 			message = "The TaskRun completed before the request to cancel the TaskRun could be processed."
 		}
 
-	case v1beta1.TaskRunReasonFailed:
+	// Tekton v1.12 introduced a more fine-grained set of reasons beside "Failed" that we previously already handled in our logic
+	// Mapping this all to reason Failed like before and fall through to our logic which will then for example map
+	// to our own OOM and PodEvicted reasons.
+	case pipelineapi.TaskRunReasonStepOOM:
+		fallthrough
+
+	case pipelineapi.TaskRunReasonPodEvicted:
+		fallthrough
+
+	case pipelineapi.TaskRunReasonStepFailed:
+		reason = string(pipelineapi.TaskRunReasonFailed)
+		fallthrough
+
+	case pipelineapi.TaskRunReasonFailed:
 		if taskRun.Status.CompletionTime != nil {
-			var pod corev1.Pod
-			if err := client.Get(ctx, types.NamespacedName{Namespace: taskRun.Namespace, Name: taskRun.Status.PodName}, &pod); err != nil {
+			pod, failedContainer, failedContainerStatus, err := extractFailedPodAndContainer(ctx, client, taskRun)
+			if err != nil {
 				// when trying to customize the Condition Message field, ensure the Message cover the case
 				// when a Pod is deleted.
 				// Note: this is an edge case, but not doing this prevent a BuildRun from being marked as Failed
 				// while the TaskRun is already with a Failed Reason in it´s condition.
 				if apierrors.IsNotFound(err) {
-					message = fmt.Sprintf("buildrun failed, pod %s not found", taskRun.Status.PodName)
+					message = fmt.Sprintf("buildrun failed, pod %s/%s not found", taskRun.Namespace, taskRun.Status.PodName)
 					break
 				}
 				return err
 			}
 
-			buildRun.Status.FailedAt = &buildv1alpha1.FailedAt{Pod: pod.Name}
-
-			// Since the container status list is not sorted, as a quick workaround mark all failed containers
-			var failures = make(map[string]struct{})
-			for _, containerStatus := range pod.Status.ContainerStatuses {
-				if containerStatus.State.Terminated != nil && containerStatus.State.Terminated.ExitCode != 0 {
-					failures[containerStatus.Name] = struct{}{}
-				}
+			//nolint:staticcheck // SA1019 we want to give users some time to adopt to failureDetails
+			buildRun.Status.FailureDetails = &buildapi.FailureDetails{
+				Location: &buildapi.Location{
+					Pod: pod.Name,
+				},
 			}
 
-			// Find the first container that failed
-			var failedContainer *corev1.Container
-			for i, container := range pod.Spec.Containers {
-				if _, has := failures[container.Name]; has {
-					failedContainer = &pod.Spec.Containers[i]
-					break
+			if pod.Status.Reason == "Evicted" {
+				message = pod.Status.Message
+				reason = buildapi.BuildRunStatePodEvicted
+				if failedContainer != nil {
+					buildRun.Status.FailureDetails.Location.Container = failedContainer.Name
 				}
-			}
+			} else if failedContainer != nil {
+				buildRun.Status.FailureDetails.Location.Container = failedContainer.Name
 
-			if failedContainer != nil {
-				buildRun.Status.FailedAt.Container = failedContainer.Name
-				message = fmt.Sprintf("buildrun step %s failed in pod %s, for detailed information: kubectl --namespace %s logs %s --container=%s",
+				message = fmt.Sprintf("buildrun step %s failed, for detailed information: kubectl --namespace %s logs %s --container=%s",
 					failedContainer.Name,
-					pod.Name,
 					pod.Namespace,
 					pod.Name,
 					failedContainer.Name,
 				)
-			} else if pod.Status.Reason == "Evicted" {
-				message = pod.Status.Message
-				reason = buildv1alpha1.BuildRunStatePodEvicted
+
+				if failedContainerStatus != nil && failedContainerStatus.State.Terminated != nil {
+					if failedContainerStatus.State.Terminated.Reason == "OOMKilled" {
+						reason = buildapi.BuildRunStateStepOutOfMemory
+						message = fmt.Sprintf("buildrun step %s failed due to out-of-memory, for detailed information: kubectl --namespace %s logs %s --container=%s",
+							failedContainer.Name,
+							pod.Namespace,
+							pod.Name,
+							failedContainer.Name,
+						)
+					} else if failedContainer.Name == "step-image-processing" && failedContainerStatus.State.Terminated.ExitCode == 22 {
+						reason = buildapi.BuildRunStateVulnerabilitiesFound
+						message = fmt.Sprintf("Vulnerabilities have been found in the image which can be seen in the buildrun status. For detailed information,see kubectl --namespace %s logs %s --container=%s",
+							pod.Namespace,
+							pod.Name,
+							failedContainer.Name,
+						)
+					}
+				}
 			} else {
 				message = fmt.Sprintf("buildrun failed due to an unexpected error in pod %s: for detailed information: kubectl --namespace %s logs %s --all-containers",
 					pod.Name,
@@ -124,9 +167,9 @@ func UpdateBuildRunUsingTaskRunCondition(ctx context.Context, client client.Clie
 		}
 	}
 
-	buildRun.Status.SetCondition(&buildv1alpha1.Condition{
+	buildRun.Status.SetCondition(&buildapi.Condition{
 		LastTransitionTime: metav1.Now(),
-		Type:               buildv1alpha1.Succeeded,
+		Type:               buildapi.Succeeded,
 		Status:             status,
 		Reason:             reason,
 		Message:            message,
@@ -135,15 +178,209 @@ func UpdateBuildRunUsingTaskRunCondition(ctx context.Context, client client.Clie
 	return nil
 }
 
+// UpdateBuildRunUsingPipelineRunCondition updates the BuildRun Succeeded Condition for PipelineRun conditions
+func UpdateBuildRunUsingPipelineRunCondition(ctx context.Context, client client.Client, buildRun *buildapi.BuildRun, pipelineRun *pipelineapi.PipelineRun, prCondition *apis.Condition) error {
+	reason, message := prCondition.Reason, prCondition.Message
+	status := prCondition.Status
+
+	switch reason {
+	case "PipelineRunTimeout":
+		reason = "BuildRunTimeout"
+		var timeout time.Duration
+		if pipelineRun.Spec.Timeouts != nil && pipelineRun.Spec.Timeouts.Pipeline != nil {
+			timeout = pipelineRun.Spec.Timeouts.Pipeline.Duration
+		} else {
+			// if the PipelineRun does not have a timeout set, we cannot use it to determine the BuildRun timeout
+			timeout = time.Since(pipelineRun.CreationTimestamp.Time)
+		}
+		message = fmt.Sprintf("BuildRun %s failed to finish within %s",
+			buildRun.Name,
+			timeout,
+		)
+
+	case "PipelineRunCancelled":
+		if buildRun.IsCanceled() {
+			status = corev1.ConditionFalse
+			reason = buildapi.BuildRunStateCancel
+			message = "The BuildRun and underlying PipelineRun were canceled successfully."
+		}
+
+	case "Succeeded":
+		if buildRun.IsCanceled() {
+			message = "The PipelineRun completed before the request to cancel the PipelineRun could be processed."
+		}
+
+	case "Failed":
+		// For PipelineRun failures, we need to get the underlying TaskRuns to extract failure details
+		if pipelineRun.Status.CompletionTime != nil {
+			// Try to extract failure details from the first failed TaskRun
+			failureDetails, err := extractPipelineRunFailureDetails(ctx, client, pipelineRun)
+			if err != nil {
+				// Log the error but continue with a generic message
+				ctxlog.Error(ctx, err, "failed to extract PipelineRun failure details",
+					"buildRun", buildRun.Name,
+					"namespace", buildRun.Namespace,
+					"pipelineRun", pipelineRun.Name)
+
+				// Fall back to generic message
+				message = fmt.Sprintf("PipelineRun %s failed", pipelineRun.Name)
+			} else {
+				// Use the extracted failure details
+				reason = failureDetails.Reason
+				message = failureDetails.Message
+
+				// Set failure details if available
+				if failureDetails.FailureDetails != nil {
+					buildRun.Status.FailureDetails = failureDetails.FailureDetails
+				}
+			}
+		}
+	}
+
+	buildRun.Status.SetCondition(&buildapi.Condition{
+		LastTransitionTime: metav1.Now(),
+		Type:               buildapi.Succeeded,
+		Status:             status,
+		Reason:             reason,
+		Message:            message,
+	})
+
+	return nil
+}
+
+// PipelineRunFailureDetails contains extracted failure information from a PipelineRun
+type PipelineRunFailureDetails struct {
+	Reason         string
+	Message        string
+	FailureDetails *buildapi.FailureDetails
+}
+
+// extractPipelineRunFailureDetails extracts detailed failure information from a failed PipelineRun
+func extractPipelineRunFailureDetails(ctx context.Context, client client.Client, pipelineRun *pipelineapi.PipelineRun) (*PipelineRunFailureDetails, error) {
+	if len(pipelineRun.Status.ChildReferences) == 0 {
+		return &PipelineRunFailureDetails{
+			Reason:  "PipelineRunFailed",
+			Message: fmt.Sprintf("PipelineRun %s failed with no child TaskRuns", pipelineRun.Name),
+		}, nil
+	}
+
+	// Look for failed TaskRuns in the child references
+	for _, childRef := range pipelineRun.Status.ChildReferences {
+		if childRef.Kind == "TaskRun" {
+			taskRun := &pipelineapi.TaskRun{}
+			err := client.Get(ctx, types.NamespacedName{
+				Name:      childRef.Name,
+				Namespace: pipelineRun.Namespace,
+			}, taskRun)
+
+			if err != nil {
+				if apierrors.IsNotFound(err) {
+					// TaskRun was deleted, continue to next one
+					continue
+				}
+				return nil, fmt.Errorf("failed to get TaskRun %s: %w", childRef.Name, err)
+			}
+
+			// Check if this TaskRun failed
+			condition := taskRun.Status.GetCondition(apis.ConditionSucceeded)
+			if condition != nil && condition.Status == corev1.ConditionFalse {
+				// Extract failure details from this TaskRun
+				pod, failedContainer, failedContainerStatus, err := extractFailedPodAndContainer(ctx, client, taskRun)
+				if err != nil {
+					if apierrors.IsNotFound(err) {
+						return &PipelineRunFailureDetails{
+							Reason:  "PipelineRunFailed",
+							Message: fmt.Sprintf("PipelineRun %s failed, pod %s/%s not found", pipelineRun.Name, taskRun.Namespace, taskRun.Status.PodName),
+						}, nil
+					}
+					return nil, fmt.Errorf("failed to extract failure details from TaskRun %s: %w", taskRun.Name, err)
+				}
+
+				// Build failure details similar to TaskRun handling
+				failureDetails := &buildapi.FailureDetails{
+					Location: &buildapi.Location{
+						Pod: pod.Name,
+					},
+				}
+
+				var reason, message string
+
+				if pod.Status.Reason == "Evicted" {
+					message = pod.Status.Message
+					reason = buildapi.BuildRunStatePodEvicted
+					if failedContainer != nil {
+						failureDetails.Location.Container = failedContainer.Name
+					}
+				} else if failedContainer != nil {
+					failureDetails.Location.Container = failedContainer.Name
+
+					message = fmt.Sprintf("PipelineRun %s failed in step %s, for detailed information: kubectl --namespace %s logs %s --container=%s",
+						pipelineRun.Name,
+						failedContainer.Name,
+						pod.Namespace,
+						pod.Name,
+						failedContainer.Name,
+					)
+
+					if failedContainerStatus != nil && failedContainerStatus.State.Terminated != nil {
+						if failedContainerStatus.State.Terminated.Reason == "OOMKilled" {
+							reason = buildapi.BuildRunStateStepOutOfMemory
+							message = fmt.Sprintf("PipelineRun %s failed due to out-of-memory in step %s, for detailed information: kubectl --namespace %s logs %s --container=%s",
+								pipelineRun.Name,
+								failedContainer.Name,
+								pod.Namespace,
+								pod.Name,
+								failedContainer.Name,
+							)
+						} else if failedContainer.Name == "step-image-processing" && failedContainerStatus.State.Terminated.ExitCode == 22 {
+							reason = buildapi.BuildRunStateVulnerabilitiesFound
+							message = fmt.Sprintf("Vulnerabilities have been found in the image from PipelineRun %s, for detailed information: kubectl --namespace %s logs %s --container=%s",
+								pipelineRun.Name,
+								pod.Namespace,
+								pod.Name,
+								failedContainer.Name,
+							)
+						}
+					}
+				} else {
+					message = fmt.Sprintf("PipelineRun %s failed due to an unexpected error in pod %s: for detailed information: kubectl --namespace %s logs %s --all-containers",
+						pipelineRun.Name,
+						pod.Name,
+						pod.Namespace,
+						pod.Name,
+					)
+				}
+
+				// If no specific reason was set, use a generic one
+				if reason == "" {
+					reason = "PipelineRunFailed"
+				}
+
+				return &PipelineRunFailureDetails{
+					Reason:         reason,
+					Message:        message,
+					FailureDetails: failureDetails,
+				}, nil
+			}
+		}
+	}
+
+	// If no specific failure details were found, return a generic message
+	return &PipelineRunFailureDetails{
+		Reason:  "PipelineRunFailed",
+		Message: fmt.Sprintf("PipelineRun %s failed", pipelineRun.Name),
+	}, nil
+}
+
 // UpdateConditionWithFalseStatus sets the Succeeded condition fields and mark
 // the condition as Status False. It also updates the object in the cluster by
 // calling client Status Update
-func UpdateConditionWithFalseStatus(ctx context.Context, client client.Client, buildRun *buildv1alpha1.BuildRun, errorMessage string, reason string) error {
+func UpdateConditionWithFalseStatus(ctx context.Context, client client.Client, buildRun *buildapi.BuildRun, errorMessage string, reason string) error {
 	now := metav1.Now()
 	buildRun.Status.CompletionTime = &now
-	buildRun.Status.SetCondition(&buildv1alpha1.Condition{
+	buildRun.Status.SetCondition(&buildapi.Condition{
 		LastTransitionTime: now,
-		Type:               buildv1alpha1.Succeeded,
+		Type:               buildapi.Succeeded,
 		Status:             corev1.ConditionFalse,
 		Reason:             reason,
 		Message:            errorMessage,
@@ -154,4 +391,27 @@ func UpdateConditionWithFalseStatus(ctx context.Context, client client.Client, b
 	}
 
 	return nil
+}
+
+// UpdateImageBuildRunFromExecutor updates the BuildRun status based on the executor object type
+func UpdateImageBuildRunFromExecutor(ctx context.Context, client client.Client, buildRun *buildapi.BuildRun, executorObj client.Object, conditions *apis.Condition) error {
+	if taskRunObj, ok := executorObj.(*pipelineapi.TaskRun); ok {
+		if err := UpdateBuildRunUsingTaskRunCondition(ctx, client, buildRun, taskRunObj, conditions); err != nil {
+			ctxlog.Error(ctx, err, "failed to update BuildRun status using TaskRun condition", "buildRun", buildRun.Name, "namespace", buildRun.Namespace, "taskRun", taskRunObj.Name)
+			return err
+		}
+		UpdateBuildRunUsingTaskFailures(ctx, client, buildRun, taskRunObj)
+		return nil
+	} else if pipelineRunObj, ok := executorObj.(*pipelineapi.PipelineRun); ok {
+		// For PipelineRuns, we need to handle the status update differently
+		if err := UpdateBuildRunUsingPipelineRunCondition(ctx, client, buildRun, pipelineRunObj, conditions); err != nil {
+			ctxlog.Error(ctx, err, "failed to update BuildRun status using PipelineRun condition", "buildRun", buildRun.Name, "namespace", buildRun.Namespace, "pipelineRun", pipelineRunObj.Name)
+			return err
+		}
+		return nil
+	}
+
+	// If we get here, the object type is not supported
+	ctxlog.Error(ctx, fmt.Errorf("unsupported executor object type: %T", executorObj), "failed to update BuildRun status", "buildRun", buildRun.Name, "namespace", buildRun.Namespace)
+	return fmt.Errorf("unsupported executor object type: %T", executorObj)
 }

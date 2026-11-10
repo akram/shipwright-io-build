@@ -6,27 +6,52 @@ on:
   workflow_dispatch:  # Manual trigger
 
 jobs:
-  build:
-    if: ${{ github.repository == 'shipwright-io/build' }}
+  base-image-build:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.repository == 'shipwright-io/build' }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - base
+          - git
+          - image-processing
+          - waiter
+        tags: [latest, ubi10] 
+        include:
+          - image: git
+            tags: latest
+            dockerfile: Dockerfile.ubi9
+          - image: git
+            tags: ubi10
+            dockerfile: Dockerfile
+      # We cannot run in parallel because the base image must be built first
+      max-parallel: 1
 
     steps:
-      - name: checkout code
-        uses: actions/checkout@v2
+      - uses: actions/checkout@v6
 
       # https://github.com/docker/setup-qemu-action
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v1
+        uses: docker/setup-qemu-action@v4
 
       # https://github.com/docker/setup-buildx-action
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v1
+        uses: docker/setup-buildx-action@v4
 
       - name: Login to container registry
-        run: echo "${{ secrets.REGISTRY_PASSWORD }}" | docker login -u "${{ secrets.REGISTRY_USERNAME }}" --password-stdin quay.io
+        run: echo ${{ secrets.GITHUB_TOKEN }} | docker login -u ${{ github.repository_owner }} --password-stdin ghcr.io
 
-      - name: Build Git
+      - name: Build Image
+        working-directory: images/${{ matrix.image }}
         run: |
-          pushd images/git
-            IMAGE=quay.io/shipwright/base-git docker buildx bake --push -f ../docker-bake.hcl
-          popd
+          if [[ "${{ matrix.tags }}" == "ubi10" ]]; then
+          BUILD_IMAGE="registry.access.redhat.com/ubi10-minimal:latest"
+          else
+          BUILD_IMAGE="registry.access.redhat.com/ubi9-minimal:latest"
+          fi
+          NAMESPACE=$(tr '[:upper:]' '[:lower:]' <<<${{ github.repository_owner }})
+          IMAGE=ghcr.io/${NAMESPACE}/base-${{ matrix.image }} \
+          NAMESPACE="${NAMESPACE}" \
+          TAG=${{matrix.tags}} BUILD_IMAGE=$BUILD_IMAGE \
+          DOCKERFILE=${{matrix.dockerfile || 'Dockerfile' }} docker buildx bake --push -f ../docker-bake.hcl

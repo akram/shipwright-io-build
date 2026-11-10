@@ -79,6 +79,16 @@ func (s BuildStrategy) GetParameters() []Parameter {
 	return s.Spec.Parameters
 }
 
+// GetSecurityContext returns the security context defined by the build strategy
+func (s BuildStrategy) GetSecurityContext() *BuildStrategySecurityContext {
+	return s.Spec.SecurityContext
+}
+
+// GetVolumes returns the volumes defined by the build strategy
+func (s BuildStrategy) GetVolumes() []BuildStrategyVolume {
+	return s.Spec.Volumes
+}
+
 func init() {
 	SchemeBuilder.Register(&BuildStrategy{}, &BuildStrategyList{})
 }

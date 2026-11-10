@@ -5,32 +5,96 @@
 package resources
 
 import (
-	buildv1alpha1 "github.com/shipwright-io/build/pkg/apis/build/v1alpha1"
+	"strconv"
+	"strings"
+	"time"
+
+	pipelineapi "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	buildapi "github.com/shipwright-io/build/pkg/apis/build/v1beta1"
 	"github.com/shipwright-io/build/pkg/config"
 	"github.com/shipwright-io/build/pkg/reconciler/buildrun/resources/sources"
-	"github.com/tektoncd/pipeline/pkg/apis/pipeline/v1beta1"
 )
 
-// AmendTaskSpecWithSources adds steps, results and volumes for spec.source and spec.sources
-func AmendTaskSpecWithSources(
-	cfg *config.Config,
-	taskSpec *v1beta1.TaskSpec,
-	build *buildv1alpha1.Build,
-) {
-	// create the step for spec.source, either Git or Bundle
-	switch {
-	case build.Spec.Source.BundleContainer != nil:
-		sources.AppendBundleStep(cfg, taskSpec, build.Spec.Source, "default")
+const defaultSourceName = "default"
 
-	case build.Spec.Source.URL != "":
-		sources.AppendGitStep(cfg, taskSpec, build.Spec.Source, "default")
+const sourceTimestampName = "source-timestamp"
+
+// isLocalCopyBuildSource appends all "Sources" in a single slice, and if any entry is typed
+// "LocalCopy" it returns first LocalCopy typed BuildSource found, or nil.
+func isLocalCopyBuildSource(
+	build *buildapi.Build,
+	buildRun *buildapi.BuildRun,
+) *buildapi.Local {
+	if buildRun.Spec.Source != nil && buildRun.Spec.Source.Type == buildapi.LocalType {
+		return buildRun.Spec.Source.Local
 	}
 
-	// create the step for spec.sources, this will eventually change into different steps depending on the type of the source
-	if build.Spec.Sources != nil {
-		for _, source := range *build.Spec.Sources {
-			// today, we only have HTTP sources
-			sources.AppendHTTPStep(cfg, taskSpec, source)
+	if build.Spec.Source != nil && build.Spec.Source.Type == buildapi.LocalType {
+		return build.Spec.Source.Local
+	}
+
+	return nil
+}
+
+func appendSourceTimestampResult(taskSpec *pipelineapi.TaskSpec) {
+	taskSpec.Results = append(taskSpec.Results,
+		pipelineapi.TaskResult{
+			Name:        sources.TaskResultName(defaultSourceName, sourceTimestampName),
+			Description: "The timestamp of the source.",
+		},
+	)
+}
+
+// AmendTaskSpecWithSources adds the necessary steps to either wait for user upload ("LocalCopy"), or
+// alternatively, configures the Task steps to use bundle and "git clone".
+func AmendTaskSpecWithSources(
+	cfg *config.Config,
+	taskSpec *pipelineapi.TaskSpec,
+	build *buildapi.Build,
+	buildRun *buildapi.BuildRun,
+) {
+	if localCopy := isLocalCopyBuildSource(build, buildRun); localCopy != nil {
+		sources.AppendLocalCopyStep(cfg, taskSpec, localCopy.Timeout)
+	} else if build.Spec.Source != nil {
+
+		// create the step for spec.source, either Git or Bundle
+		switch build.Spec.Source.Type {
+		case buildapi.OCIArtifactType:
+			if build.Spec.Source.OCIArtifact != nil {
+				appendSourceTimestampResult(taskSpec)
+				sources.AppendBundleStep(cfg, taskSpec, build.Spec.Source.OCIArtifact, defaultSourceName)
+			}
+		case buildapi.GitType:
+			if build.Spec.Source.Git != nil {
+				appendSourceTimestampResult(taskSpec)
+				sources.AppendGitStep(cfg, taskSpec, *build.Spec.Source.Git, defaultSourceName)
+			}
+		}
+	}
+}
+
+func updateBuildRunStatusWithSourceResult(buildrun *buildapi.BuildRun, results []pipelineapi.TaskRunResult) {
+	buildSpec := buildrun.Status.BuildSpec
+
+	if buildSpec.Source == nil {
+		return
+	}
+
+	switch {
+	case buildSpec.Source.Type == buildapi.OCIArtifactType && buildSpec.Source.OCIArtifact != nil:
+		sources.AppendBundleResult(buildrun, defaultSourceName, results)
+
+	case buildSpec.Source.Type == buildapi.GitType && buildSpec.Source.Git != nil:
+		sources.AppendGitResult(buildrun, defaultSourceName, results)
+	}
+
+	if sourceTimestamp := sources.FindResultValue(results, defaultSourceName, sourceTimestampName); strings.TrimSpace(sourceTimestamp) != "" {
+		if sec, err := strconv.ParseInt(sourceTimestamp, 10, 64); err == nil {
+			if buildrun.Status.Source != nil {
+				buildrun.Status.Source.Timestamp = &metav1.Time{Time: time.Unix(sec, 0)}
+			}
 		}
 	}
 }

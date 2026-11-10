@@ -7,10 +7,10 @@ package bundle
 import (
 	"archive/tar"
 	"bufio"
-	"bytes"
 	"fmt"
 	"io"
 	"io/fs"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,6 +18,7 @@ import (
 
 	"github.com/go-git/go-git/v5/plumbing/format/gitignore"
 	"github.com/google/go-containerregistry/pkg/name"
+	containerreg "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/empty"
 	"github.com/google/go-containerregistry/pkg/v1/mutate"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
@@ -26,26 +27,26 @@ import (
 
 const shpIgnoreFilename = ".shpignore"
 
+// UnpackDetails contains details about the files that were unpacked
+type UnpackDetails struct {
+	MostRecentFileTimestamp *time.Time
+}
+
 // PackAndPush a local directory as-is into a container image. See
 // remote.Option for optional options to the image push to the registry, for
 // example to provide the appropriate access credentials.
 func PackAndPush(ref name.Reference, directory string, options ...remote.Option) (name.Digest, error) {
-	r, err := Pack(directory)
+	bundleLayer, err := tarball.LayerFromOpener(func() (io.ReadCloser, error) { return Pack(directory) })
 	if err != nil {
 		return name.Digest{}, err
 	}
 
-	bundleLayer, err := tarball.LayerFromReader(r)
+	image, err := mutate.Time(empty.Image, time.Unix(0, 0))
 	if err != nil {
 		return name.Digest{}, err
 	}
 
-	image, err := mutate.AppendLayers(empty.Image, bundleLayer)
-	if err != nil {
-		return name.Digest{}, err
-	}
-
-	image, err = mutate.Time(image, time.Unix(0, 0))
+	image, err = mutate.AppendLayers(image, bundleLayer)
 	if err != nil {
 		return name.Digest{}, err
 	}
@@ -68,31 +69,36 @@ func PackAndPush(ref name.Reference, directory string, options ...remote.Option)
 // PullAndUnpack a container image layer content into a local directory. Analog
 // to the bundle.PackAndPush function, optional remote.Option can be used to
 // configure settings for the image pull, i.e. access credentials.
-func PullAndUnpack(ref name.Reference, targetPath string, options ...remote.Option) error {
+func PullAndUnpack(ref name.Reference, targetPath string, options ...remote.Option) (containerreg.Image, error) {
 	desc, err := remote.Get(ref, options...)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	image, err := desc.Image()
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	rc := mutate.Extract(image)
 	defer rc.Close()
 
-	return Unpack(rc, targetPath)
+	if _, err = Unpack(rc, targetPath); err != nil {
+		return nil, err
+	}
+
+	return image, nil
 }
 
 // Pack reads a directory and creates a tar stream with its content by:
 // - storing all directories and regular files as-is,
 // - dereferencing all symlinks and storing the respective target,
 // - ignoring all files configured in .shpignore
-func Pack(directory string) (io.Reader, error) {
+func Pack(directory string) (io.ReadCloser, error) {
 	var split = func(path string) []string { return strings.Split(path, string(filepath.Separator)) }
 
 	var write = func(w io.Writer, path string) error {
+		// #nosec G304 names are safe, they come from the listing
 		file, err := os.Open(path)
 		if err != nil {
 			return err
@@ -122,6 +128,7 @@ func Pack(directory string) (io.Reader, error) {
 	}
 
 	var patterns []gitignore.Pattern
+	// #nosec G304 names are safe
 	if file, err := os.Open(filepath.Join(directory, shpIgnoreFilename)); err == nil {
 		defer file.Close()
 
@@ -141,11 +148,18 @@ func Pack(directory string) (io.Reader, error) {
 
 	matcher := gitignore.NewMatcher(patterns)
 
-	var buf bytes.Buffer
-	var tw = tar.NewWriter(&buf)
-	defer tw.Close()
+	r, w, err := os.Pipe()
+	if err != nil {
+		return nil, err
+	}
 
-	err := filepath.WalkDir(directory, func(path string, d fs.DirEntry, err error) error {
+	var tw = tar.NewWriter(w)
+	defer func() {
+		_ = tw.Close()
+		_ = w.Close()
+	}()
+
+	err = filepath.WalkDir(directory, func(path string, d fs.DirEntry, err error) error {
 		// Bail out on path errors
 		if err != nil {
 			return err
@@ -213,55 +227,110 @@ func Pack(directory string) (io.Reader, error) {
 		}
 	})
 
-	return &buf, err
+	return r, err
 }
 
 // Unpack reads a tar stream and writes the content into the local file system
 // with all files and directories.
-func Unpack(in io.Reader, targetPath string) error {
+func Unpack(in io.Reader, targetPath string) (*UnpackDetails, error) {
+	type chmod struct {
+		name string
+		mode os.FileMode
+	}
+
+	// Make sure the target path exists and is a directory
+	if stat, err := os.Stat(targetPath); err != nil {
+		if err := os.MkdirAll(targetPath, os.FileMode(0755)); err != nil {
+			return nil, err
+		}
+	} else if !stat.IsDir() {
+		return nil, fmt.Errorf("target %q exists, but it's not a directory", targetPath)
+	}
+
+	var chmods []chmod
+	var details = UnpackDetails{}
 	var tr = tar.NewReader(in)
 	for {
 		header, err := tr.Next()
 		switch {
 		case err == io.EOF:
-			return nil
+			// before leaving, make sure to set the file permissions to the ones specified in the tar stream
+			for _, chmod := range chmods {
+				if err := os.Chmod(chmod.name, chmod.mode); err != nil {
+					return nil, err
+				}
+			}
+
+			return &details, nil
 
 		case err != nil:
-			return err
+			return nil, err
 
 		case header == nil:
 			continue
 		}
 
+		// #nosec G305 path traversal is checked by validating that the resulting path does not escape targetPath
 		var target = filepath.Join(targetPath, header.Name)
+		if rel, err := filepath.Rel(targetPath, target); err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return nil, fmt.Errorf("targetPath validation failed, %q escapes the target directory", header.Name)
+		}
+
 		switch header.Typeflag {
 		case tar.TypeDir:
-			if err := os.MkdirAll(target, os.FileMode(header.Mode)); err != nil {
-				return err
+			// Skip the root directory, since it already exists
+			if target == targetPath {
+				continue
 			}
+
+			if err := os.MkdirAll(target, os.FileMode(0777)); err != nil {
+				return nil, err
+			}
+
+			chmods = append(chmods, chmod{name: target, mode: fileMode(header)})
 
 		case tar.TypeReg:
 			// Edge case in which that tarball did not have a directory entry
 			dir, _ := filepath.Split(target)
 			if err := os.MkdirAll(dir, os.FileMode(0755)); err != nil {
-				return err
+				return nil, err
 			}
 
-			file, err := os.OpenFile(target, os.O_CREATE|os.O_RDWR, os.FileMode(header.Mode))
+			// #nosec G304 names are safe, they come from the listing
+			file, err := os.OpenFile(target, os.O_CREATE|os.O_RDWR, fileMode(header))
 			if err != nil {
-				return err
+				return nil, err
 			}
 
 			if _, err := io.Copy(file, tr); err != nil {
-				file.Close()
-				return err
+				_ = file.Close()
+				return nil, err
 			}
 
-			file.Close()
-			os.Chtimes(target, header.AccessTime, header.ModTime)
+			if err := file.Close(); err != nil {
+				return nil, err
+			}
+
+			if err := os.Chtimes(target, header.AccessTime, header.ModTime); err != nil {
+				return nil, err
+			}
+
+			if details.MostRecentFileTimestamp == nil || details.MostRecentFileTimestamp.Before(header.ModTime) {
+				details.MostRecentFileTimestamp = &header.ModTime
+			}
 
 		default:
-			return fmt.Errorf("provided tarball contains unsupported file type, only directories and regular files are supported")
+			return nil, fmt.Errorf("provided tarball contains unsupported file type, only directories and regular files are supported")
 		}
 	}
+}
+
+func fileMode(tarHeader *tar.Header) os.FileMode {
+	mode := tarHeader.Mode
+	if mode < 0 || mode > math.MaxUint32 {
+		return 0
+	}
+
+	// #nosec G115 was checked above
+	return os.FileMode(mode)
 }

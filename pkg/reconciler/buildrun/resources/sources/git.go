@@ -6,73 +6,131 @@ package sources
 
 import (
 	"fmt"
+	"strconv"
+	"strings"
 
-	buildv1alpha1 "github.com/shipwright-io/build/pkg/apis/build/v1alpha1"
-	"github.com/shipwright-io/build/pkg/config"
-	tektonv1beta1 "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1beta1"
+	pipelineapi "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1"
 	corev1 "k8s.io/api/core/v1"
+
+	buildapi "github.com/shipwright-io/build/pkg/apis/build/v1beta1"
+	"github.com/shipwright-io/build/pkg/config"
+)
+
+const (
+	commitSHAResult    = "commit-sha"
+	commitAuthorResult = "commit-author"
+	branchName         = "branch-name"
 )
 
 // AppendGitStep appends the Git step and results and volume if needed to the TaskSpec
 func AppendGitStep(
 	cfg *config.Config,
-	taskSpec *tektonv1beta1.TaskSpec,
-	source buildv1alpha1.Source,
+	taskSpec *pipelineapi.TaskSpec,
+	source buildapi.Git,
 	name string,
 ) {
 	// append the result
-	taskSpec.Results = append(taskSpec.Results, tektonv1beta1.TaskResult{
-		Name:        fmt.Sprintf("%s-source-%s-commit-sha", prefixParamsResultsVolumes, name),
-		Description: "The commit SHA of the cloned source.",
-	})
+	taskSpec.Results = append(taskSpec.Results,
+		pipelineapi.TaskResult{
+			Name:        fmt.Sprintf("%s-source-%s-%s", PrefixParamsResultsVolumes, name, commitSHAResult),
+			Description: "The commit SHA of the cloned source.",
+		},
+		pipelineapi.TaskResult{
+			Name:        fmt.Sprintf("%s-source-%s-%s", PrefixParamsResultsVolumes, name, commitAuthorResult),
+			Description: "The author of the last commit of the cloned source.",
+		},
+		pipelineapi.TaskResult{
+			Name:        fmt.Sprintf("%s-source-%s-%s", PrefixParamsResultsVolumes, name, branchName),
+			Description: "The name of the branch used of the cloned source.",
+		},
+	)
 
-	// initialize the step from the template
-	gitStep := tektonv1beta1.Step{
-		Container: *cfg.GitContainerTemplate.DeepCopy(),
-	}
-
-	// add the build-specific details
-	gitStep.Container.Name = fmt.Sprintf("source-%s", name)
-	gitStep.Container.Args = []string{
-		"--url",
-		source.URL,
-		"--target",
-		fmt.Sprintf("$(params.%s-%s)", prefixParamsResultsVolumes, paramSourceRoot),
-		"--result-file-commit-sha",
-		fmt.Sprintf("$(results.%s-source-%s-commit-sha.path)", prefixParamsResultsVolumes, name),
+	// initialize the step from the template and the build-specific arguments
+	gitStep := pipelineapi.Step{
+		Name:            fmt.Sprintf("source-%s", name),
+		Image:           cfg.GitContainerTemplate.Image,
+		ImagePullPolicy: cfg.GitContainerTemplate.ImagePullPolicy,
+		Command:         cfg.GitContainerTemplate.Command,
+		Args: []string{
+			"--url", source.URL,
+			"--target", fmt.Sprintf("$(params.%s-%s)", PrefixParamsResultsVolumes, paramSourceRoot),
+			"--result-file-commit-sha", fmt.Sprintf("$(results.%s-source-%s-%s.path)", PrefixParamsResultsVolumes, name, commitSHAResult),
+			"--result-file-commit-author", fmt.Sprintf("$(results.%s-source-%s-%s.path)", PrefixParamsResultsVolumes, name, commitAuthorResult),
+			"--result-file-branch-name", fmt.Sprintf("$(results.%s-source-%s-%s.path)", PrefixParamsResultsVolumes, name, branchName),
+			"--result-file-error-message", fmt.Sprintf("$(results.%s-error-message.path)", PrefixParamsResultsVolumes),
+			"--result-file-error-reason", fmt.Sprintf("$(results.%s-error-reason.path)", PrefixParamsResultsVolumes),
+			"--result-file-source-timestamp", fmt.Sprintf("$(results.%s-source-%s-source-timestamp.path)", PrefixParamsResultsVolumes, name),
+		},
+		Env:              cfg.GitContainerTemplate.Env,
+		ComputeResources: cfg.GitContainerTemplate.Resources,
+		SecurityContext:  cfg.GitContainerTemplate.SecurityContext,
+		WorkingDir:       cfg.GitContainerTemplate.WorkingDir,
 	}
 
 	// Check if a revision is defined
 	if source.Revision != nil {
 		// append the argument
-		gitStep.Container.Args = append(
-			gitStep.Container.Args,
+		gitStep.Args = append(
+			gitStep.Args,
 			"--revision",
 			*source.Revision,
 		)
 	}
 
-	if source.Credentials != nil {
-		// ensure the value is there
-		AppendSecretVolume(taskSpec, source.Credentials.Name)
+	// Check if shallow clone is requested
+	if source.Depth != nil && *source.Depth >= 0 {
+		gitStep.Args = append(
+			gitStep.Args,
+			"--depth",
+			strconv.Itoa(*source.Depth),
+		)
+	}
 
-		secretMountPath := fmt.Sprintf("/workspace/%s-source-secret", prefixParamsResultsVolumes)
+	// If configure, use Git URL rewrite flag
+	if cfg.GitRewriteRule {
+		gitStep.Args = append(gitStep.Args, "--git-url-rewrite")
+	}
+
+	if source.CloneSecret != nil {
+		// ensure the value is there
+		AppendSecretVolume(taskSpec, *source.CloneSecret)
+
+		secretMountPath := fmt.Sprintf("/workspace/%s-source-secret", PrefixParamsResultsVolumes)
 
 		// define the volume mount on the container
 		gitStep.VolumeMounts = append(gitStep.VolumeMounts, corev1.VolumeMount{
-			Name:      SanitizeVolumeNameForSecretName(source.Credentials.Name),
+			Name:      SanitizeVolumeNameForSecretName(*source.CloneSecret),
 			MountPath: secretMountPath,
 			ReadOnly:  true,
 		})
 
 		// append the argument
-		gitStep.Container.Args = append(
-			gitStep.Container.Args,
+		gitStep.Args = append(
+			gitStep.Args,
 			"--secret-path",
 			secretMountPath,
 		)
 	}
 
+	SetupHomeAndTmpVolumes(taskSpec, &gitStep)
 	// append the git step
 	taskSpec.Steps = append(taskSpec.Steps, gitStep)
+}
+
+// AppendGitResult append git source result to build run
+func AppendGitResult(buildRun *buildapi.BuildRun, name string, results []pipelineapi.TaskRunResult) {
+	commitAuthor := FindResultValue(results, name, commitAuthorResult)
+	commitSha := FindResultValue(results, name, commitSHAResult)
+	branchName := FindResultValue(results, name, branchName)
+
+	if strings.TrimSpace(commitAuthor) != "" || strings.TrimSpace(commitSha) != "" || strings.TrimSpace(branchName) != "" {
+		if buildRun.Status.Source == nil {
+			buildRun.Status.Source = &buildapi.SourceResult{}
+		}
+		buildRun.Status.Source.Git = &buildapi.GitSourceResult{
+			CommitAuthor: commitAuthor,
+			CommitSha:    commitSha,
+			BranchName:   branchName,
+		}
+	}
 }

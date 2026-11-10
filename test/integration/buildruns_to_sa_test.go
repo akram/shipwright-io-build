@@ -5,25 +5,25 @@
 package integration_test
 
 import (
+	"context"
 	"fmt"
 	"time"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
 
-	"github.com/shipwright-io/build/pkg/apis/build/v1alpha1"
-	"github.com/shipwright-io/build/test"
+	buildapi "github.com/shipwright-io/build/pkg/apis/build/v1beta1"
+	test "github.com/shipwright-io/build/test/v1beta1_samples"
 )
 
 var _ = Describe("Integration tests BuildRuns and Service-accounts", func() {
 
 	var (
-		cbsObject      *v1alpha1.ClusterBuildStrategy
-		buildObject    *v1alpha1.Build
-		buildRunObject *v1alpha1.BuildRun
+		cbsObject      *buildapi.ClusterBuildStrategy
+		buildObject    *buildapi.Build
+		buildRunObject *buildapi.BuildRun
 		buildSample    []byte
 		buildRunSample []byte
 	)
@@ -82,7 +82,7 @@ var _ = Describe("Integration tests BuildRuns and Service-accounts", func() {
 				return false
 			}
 
-			sampleSecret := tb.Catalog.SecretWithAnnotation(buildObject.Spec.Output.Credentials.Name, buildObject.Namespace)
+			sampleSecret := tb.Catalog.SecretWithoutAnnotation(*buildObject.Spec.Output.PushSecret, buildObject.Namespace)
 
 			Expect(tb.CreateSecret(sampleSecret)).To(BeNil())
 
@@ -96,16 +96,16 @@ var _ = Describe("Integration tests BuildRuns and Service-accounts", func() {
 			_, err = tb.GetBRTillStartTime(buildRunObject.Name)
 			Expect(err).To(BeNil())
 
-			sa, err := tb.GetSA(fmt.Sprintf("%s-sa", buildRunObject.Name))
+			sa, err := tb.GetSA(buildRunObject.Name)
 			Expect(err).To(BeNil())
 
 			// Verify that the sa have our Build specified secret
-			Expect(contains(sa.Secrets, buildObject.Spec.Output.Credentials.Name)).To(BeTrue())
+			Expect(contains(sa.Secrets, *buildObject.Spec.Output.PushSecret)).To(BeTrue())
 
 			_, err = tb.GetBRTillCompletion(buildRunObject.Name)
 			Expect(err).To(BeNil())
 
-			_, err = tb.GetSA(fmt.Sprintf("%s-sa", buildRunObject.Name))
+			_, err = tb.GetSA(buildRunObject.Name)
 			Expect(err).ToNot(BeNil())
 
 		})
@@ -130,7 +130,7 @@ var _ = Describe("Integration tests BuildRuns and Service-accounts", func() {
 				return false
 			}
 
-			sampleSecret := tb.Catalog.SecretWithAnnotation(buildObject.Spec.Output.Credentials.Name, buildObject.Namespace)
+			sampleSecret := tb.Catalog.SecretWithoutAnnotation(*buildObject.Spec.Output.PushSecret, buildObject.Namespace)
 
 			Expect(tb.CreateSecret(sampleSecret)).To(BeNil())
 
@@ -144,21 +144,21 @@ var _ = Describe("Integration tests BuildRuns and Service-accounts", func() {
 			bro, err := tb.GetBRTillStartTime(buildRunObject.Name)
 			Expect(err).To(BeNil())
 
-			sa, err := tb.GetSA(fmt.Sprintf("%s-sa", buildRunObject.Name))
+			sa, err := tb.GetSA(buildRunObject.Name)
 			Expect(err).To(BeNil())
 
 			// Verify that the sa have our Build specified secret
-			Expect(contains(sa.Secrets, buildObject.Spec.Output.Credentials.Name)).To(BeTrue())
+			Expect(contains(sa.Secrets, *buildObject.Spec.Output.PushSecret)).To(BeTrue())
 
 			// cancel the br
-			err = wait.PollImmediate(1*time.Second, 4*time.Second, func() (done bool, err error) {
+			err = wait.PollUntilContextTimeout(tb.Context, 1*time.Second, 4*time.Second, true, func(_ context.Context) (done bool, err error) {
 				bro, err = tb.GetBRTillStartTime(buildRunObject.Name)
 				if err != nil {
 					GinkgoT().Logf("error on br get: %s\n", err.Error())
 					return false, nil
 				}
 
-				bro.Spec.State = v1alpha1.BuildRunStateCancel
+				bro.Spec.State = buildapi.BuildRunRequestedStatePtr(buildapi.BuildRunStateCancel)
 				err = tb.UpdateBR(bro)
 				if err != nil {
 					GinkgoT().Logf("error on br update: %s\n", err.Error())
@@ -168,7 +168,7 @@ var _ = Describe("Integration tests BuildRuns and Service-accounts", func() {
 			})
 			Expect(err).To(BeNil())
 
-			expectedReason := v1alpha1.BuildRunStateCancel
+			expectedReason := buildapi.BuildRunStateCancel
 			actualReason, err := tb.GetBRTillDesiredReason(buildRunObject.Name, expectedReason)
 			Expect(err).To(BeNil(), fmt.Sprintf("failed to get desired BuildRun reason; expected %s, got %s", expectedReason, actualReason))
 
@@ -177,7 +177,7 @@ var _ = Describe("Integration tests BuildRuns and Service-accounts", func() {
 			Expect(err).To(BeNil())
 
 			// confirm SA gone
-			_, err = tb.GetSA(fmt.Sprintf("%s-sa", buildRunObject.Name))
+			_, err = tb.GetSA(buildRunObject.Name)
 			Expect(err).ToNot(BeNil())
 
 		})
@@ -246,7 +246,7 @@ var _ = Describe("Integration tests BuildRuns and Service-accounts", func() {
 
 			br, _ := tb.GetBRTillCompletion(buildRunObject.Name)
 			Expect(err).To(BeNil())
-			buildRunCondition := br.Status.GetCondition(v1alpha1.Succeeded)
+			buildRunCondition := br.Status.GetCondition(buildapi.Succeeded)
 
 			Expect(buildRunCondition).ToNot(BeNil())
 			Expect(buildRunCondition.Status).To(Equal(corev1.ConditionFalse))

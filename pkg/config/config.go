@@ -13,7 +13,9 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
+
+	"github.com/shipwright-io/build/pkg/env"
 )
 
 const (
@@ -28,18 +30,23 @@ const (
 	// the Git image is built using ko which can replace environment variable values in the deployment, so once we decide to move
 	// from environment variables to a ConfigMap, then we should move the container template, but retain the environment variable
 	// (or make it an argument like Tekton)
-	gitDefaultImage            = "quay.io/shipwright/git:latest"
+	gitDefaultImage            = "ghcr.io/shipwright-io/build/git:latest"
 	gitImageEnvVar             = "GIT_CONTAINER_IMAGE"
 	gitContainerTemplateEnvVar = "GIT_CONTAINER_TEMPLATE"
 
-	mutateImageDefaultImage            = "quay.io/shipwright/mutate-image:latest"
-	mutateImageEnvVar                  = "MUTATE_IMAGE_CONTAINER_IMAGE"
-	mutateImageContainerTemplateEnvVar = "MUTATE_IMAGE_CONTAINER_TEMPLATE"
+	imageProcessingDefaultImage            = "ghcr.io/shipwright-io/build/image-processing:latest"
+	imageProcessingImageEnvVar             = "IMAGE_PROCESSING_CONTAINER_IMAGE"
+	imageProcessingContainerTemplateEnvVar = "IMAGE_PROCESSING_CONTAINER_TEMPLATE"
 
 	// Analog to the Git image, the bundle image is also created by ko
-	bundleDefaultImage            = "quay.io/shipwright/bundle:latest"
+	bundleDefaultImage            = "ghcr.io/shipwright-io/build/bundle:latest"
 	bundleImageEnvVar             = "BUNDLE_CONTAINER_IMAGE"
 	bundleContainerTemplateEnvVar = "BUNDLE_CONTAINER_TEMPLATE"
+
+	// environment variable to hold waiter's container image, created by ko
+	waiterDefaultImage            = "ghcr.io/shipwright-io/build/waiter:latest"
+	waiterImageEnvVar             = "WAITER_CONTAINER_IMAGE"
+	waiterContainerTemplateEnvVar = "WAITER_CONTAINER_TEMPLATE"
 
 	// environment variable to override the buckets
 	metricBuildRunCompletionDurationBucketsEnvVar = "PROMETHEUS_BR_COMP_DUR_BUCKETS"
@@ -61,6 +68,7 @@ const (
 	controllerBuildRunMaxConcurrentReconciles             = "BUILDRUN_MAX_CONCURRENT_RECONCILES"
 	controllerBuildStrategyMaxConcurrentReconciles        = "BUILDSTRATEGY_MAX_CONCURRENT_RECONCILES"
 	controllerClusterBuildStrategyMaxConcurrentReconciles = "CLUSTERBUILDSTRATEGY_MAX_CONCURRENT_RECONCILES"
+	controllerBuildrunExecutorEnvVar                      = "BUILDRUN_EXECUTOR"
 
 	// environment variables for the kube API
 	kubeAPIBurst = "KUBE_API_BURST"
@@ -68,7 +76,42 @@ const (
 
 	terminationLogPathDefault = "/dev/termination-log"
 	terminationLogPathEnvVar  = "TERMINATION_LOG_PATH"
+
+	// environment variable for the Git rewrite setting
+	useGitRewriteRule = "GIT_ENABLE_REWRITE_RULE"
+
+	// environment variable to hold vulnerability count limit
+	VulnerabilityCountLimitEnvVar = "VULNERABILITY_COUNT_LIMIT"
+
+	// environment variable to override the forbidden env var blocklist
+	forbiddenEnvVarNamesEnvVar = "FORBIDDEN_ENV_VAR_NAMES"
 )
+
+// defaultForbiddenEnvVarNames is the default blocklist of environment variable
+// names that are rejected for security reasons. Entries ending with "*" are
+// treated as prefix matches (e.g. "LD_*" blocks any variable starting with "LD_").
+var defaultForbiddenEnvVarNames = []string{
+	"LD_*",
+	"BASH_FUNC_*",
+	"LD_PRELOAD",
+	"LD_LIBRARY_PATH",
+	"LD_AUDIT",
+	"LD_DEBUG",
+	"LD_PROFILE",
+	"BASH_ENV",
+	"ENV",
+	"CDPATH",
+	"PYTHONSTARTUP",
+	"PERL5OPT",
+	"PERLLIB",
+	"PERL5LIB",
+	"RUBYOPT",
+	"NODE_OPTIONS",
+}
+
+func init() {
+	env.SetForbiddenEnvVars(defaultForbiddenEnvVarNames)
+}
 
 var (
 	// arrays are not possible as constants
@@ -76,23 +119,28 @@ var (
 	metricBuildRunEstablishDurationBuckets  = []float64{0, 1, 2, 3, 5, 7, 10, 15, 20, 30}
 	metricBuildRunRampUpDurationBuckets     = prometheus.LinearBuckets(0, 1, 10)
 
-	root    = pointer.Int64Ptr(0)
-	nonRoot = pointer.Int64Ptr(1000)
+	root    = ptr.To[int64](0)
+	nonRoot = ptr.To[int64](1000)
 )
 
 // Config hosts different parameters that
 // can be set to use on the Build controllers
 type Config struct {
-	CtxTimeOut time.Duration
-	GitContainerTemplate,
-	MutateImageContainerTemplate corev1.Container
-	BundleContainerTemplate       corev1.Container
-	RemoteArtifactsContainerImage string
-	TerminationLogPath            string
-	Prometheus                    PrometheusConfig
-	ManagerOptions                ManagerOptions
-	Controllers                   Controllers
-	KubeAPIOptions                KubeAPIOptions
+	CtxTimeOut                       time.Duration
+	GitContainerTemplate             Step
+	ImageProcessingContainerTemplate Step
+	BundleContainerTemplate          Step
+	WaiterContainerTemplate          Step
+	RemoteArtifactsContainerImage    string
+	TerminationLogPath               string
+	Prometheus                       PrometheusConfig
+	ManagerOptions                   ManagerOptions
+	Controllers                      Controllers
+	KubeAPIOptions                   KubeAPIOptions
+	GitRewriteRule                   bool
+	VulnerabilityCountLimit          int
+	BuildrunExecutor                 string
+	ForbiddenEnvVarNames             []string
 }
 
 // PrometheusConfig contains the specific configuration for the
@@ -130,66 +178,158 @@ type KubeAPIOptions struct {
 	Burst int
 }
 
+type Step struct {
+	Args            []string                    `json:"args,omitempty"`
+	Command         []string                    `json:"command,omitempty"`
+	Env             []corev1.EnvVar             `json:"env,omitempty"`
+	Image           string                      `json:"image,omitempty"`
+	ImagePullPolicy corev1.PullPolicy           `json:"imagePullPolicy,omitempty"`
+	Resources       corev1.ResourceRequirements `json:"resources,omitempty"`
+	SecurityContext *corev1.SecurityContext     `json:"securityContext,omitempty"`
+	WorkingDir      string                      `json:"workingDir,omitempty"`
+}
+
 // NewDefaultConfig returns a new Config, with context timeout and default Kaniko image.
 func NewDefaultConfig() *Config {
 	return &Config{
-		CtxTimeOut: contextTimeout,
-		GitContainerTemplate: corev1.Container{
+		CtxTimeOut:                    contextTimeout,
+		RemoteArtifactsContainerImage: remoteArtifactsDefaultImage,
+		TerminationLogPath:            terminationLogPathDefault,
+		GitRewriteRule:                false,
+		VulnerabilityCountLimit:       50,
+		BuildrunExecutor:              "TaskRun",
+		ForbiddenEnvVarNames:          defaultForbiddenEnvVarNames,
+
+		GitContainerTemplate: Step{
 			Image: gitDefaultImage,
 			Command: []string{
 				"/ko-app/git",
 			},
+			Env: []corev1.EnvVar{
+				// This directory is created in the base image as writable for everybody
+				{
+					Name:  "HOME",
+					Value: "/shared-home",
+				},
+				{
+					Name:  "GIT_SHOW_LISTING",
+					Value: "false",
+				},
+			},
 			SecurityContext: &corev1.SecurityContext{
-				RunAsUser:  nonRoot,
-				RunAsGroup: nonRoot,
+				AllowPrivilegeEscalation: ptr.To(false),
+				Capabilities: &corev1.Capabilities{
+					Drop: []corev1.Capability{
+						"ALL",
+					},
+				},
+				RunAsUser:              nonRoot,
+				RunAsGroup:             nonRoot,
+				ReadOnlyRootFilesystem: ptr.To(true),
 			},
 		},
-		BundleContainerTemplate: corev1.Container{
+
+		BundleContainerTemplate: Step{
 			Image: bundleDefaultImage,
 			Command: []string{
 				"/ko-app/bundle",
 			},
-			SecurityContext: &corev1.SecurityContext{
-				RunAsUser:  nonRoot,
-				RunAsGroup: nonRoot,
-			},
-		},
-		RemoteArtifactsContainerImage: remoteArtifactsDefaultImage,
-		MutateImageContainerTemplate: corev1.Container{
-			Image: mutateImageDefaultImage,
-			Command: []string{
-				"/ko-app/mutate-image",
-			},
-			// We explicitly define HOME=/tekton/home because this was always set in the
-			// default configuration of Tekton until v0.24.0, see https://github.com/tektoncd/pipeline/pull/3878
+			// This directory is created in the base image as writable for everybody
 			Env: []corev1.EnvVar{
 				{
 					Name:  "HOME",
-					Value: "/tekton/home",
+					Value: "/shared-home",
+				},
+				{
+					Name:  "BUNDLE_SHOW_LISTING",
+					Value: "false",
 				},
 			},
-			// The mutate image step runs after the build strategy steps where an arbitrary
+			SecurityContext: &corev1.SecurityContext{
+				AllowPrivilegeEscalation: ptr.To(false),
+				Capabilities: &corev1.Capabilities{
+					Drop: []corev1.Capability{
+						"ALL",
+					},
+				},
+				RunAsUser:              nonRoot,
+				RunAsGroup:             nonRoot,
+				ReadOnlyRootFilesystem: ptr.To(true),
+			},
+		},
+
+		ImageProcessingContainerTemplate: Step{
+			Image: imageProcessingDefaultImage,
+			Command: []string{
+				"/ko-app/image-processing",
+			},
+			// This directory is created in the base image as writable for everybody
+			Env: []corev1.EnvVar{
+				{
+					Name:  "HOME",
+					Value: "/shared-home",
+				},
+			},
+			// The image processing step runs after the build strategy steps where an arbitrary
 			// user could have been used to write the result files for the image digest. The
-			// mutate image step will overwrite the image digest file. To be able to do this
+			// image processing step will overwrite the image digest file. To be able to do this
 			// in all possible scenarios, we run this step as root with DAC_OVERRIDE
 			// capability.
 			SecurityContext: &corev1.SecurityContext{
-				RunAsUser: root,
+				AllowPrivilegeEscalation: ptr.To(false),
+				RunAsUser:                root,
+				RunAsGroup:               root,
+				ReadOnlyRootFilesystem:   ptr.To(true),
 				Capabilities: &corev1.Capabilities{
 					Add: []corev1.Capability{
 						"DAC_OVERRIDE",
 					},
+					Drop: []corev1.Capability{
+						"ALL",
+					},
 				},
 			},
 		},
+
+		WaiterContainerTemplate: Step{
+			Image: waiterDefaultImage,
+			Command: []string{
+				"/ko-app/waiter",
+			},
+			Args: []string{
+				"start",
+				"--lock-file=/shp-tmp/waiter.lock", // Sets lock file path to the generated tmp volume to prevent it from using its own filesystem.
+			},
+			// This directory is created in the base image as writable for everybody
+			Env: []corev1.EnvVar{
+				{
+					Name:  "HOME",
+					Value: "/shared-home",
+				},
+			},
+			SecurityContext: &corev1.SecurityContext{
+				AllowPrivilegeEscalation: ptr.To(false),
+				Capabilities: &corev1.Capabilities{
+					Drop: []corev1.Capability{
+						"ALL",
+					},
+				},
+				RunAsUser:              nonRoot,
+				RunAsGroup:             nonRoot,
+				ReadOnlyRootFilesystem: ptr.To(true),
+			},
+		},
+
 		Prometheus: PrometheusConfig{
 			BuildRunCompletionDurationBuckets: metricBuildRunCompletionDurationBuckets,
 			BuildRunEstablishDurationBuckets:  metricBuildRunEstablishDurationBuckets,
 			BuildRunRampUpDurationBuckets:     metricBuildRunRampUpDurationBuckets,
 		},
+
 		ManagerOptions: ManagerOptions{
 			LeaderElectionNamespace: leaderElectionNamespaceDefault,
 		},
+
 		Controllers: Controllers{
 			Build: ControllerOptions{
 				MaxConcurrentReconciles: 0,
@@ -204,11 +344,11 @@ func NewDefaultConfig() *Config {
 				MaxConcurrentReconciles: 0,
 			},
 		},
+
 		KubeAPIOptions: KubeAPIOptions{
 			QPS:   0,
 			Burst: 0,
 		},
-		TerminationLogPath: terminationLogPathDefault,
 	}
 }
 
@@ -223,7 +363,7 @@ func (c *Config) SetConfigFromEnv() error {
 	}
 
 	if gitContainerTemplate := os.Getenv(gitContainerTemplateEnvVar); gitContainerTemplate != "" {
-		c.GitContainerTemplate = corev1.Container{}
+		c.GitContainerTemplate = Step{}
 		if err := json.Unmarshal([]byte(gitContainerTemplate), &c.GitContainerTemplate); err != nil {
 			return err
 		}
@@ -237,24 +377,43 @@ func (c *Config) SetConfigFromEnv() error {
 		c.GitContainerTemplate.Image = gitImage
 	}
 
-	if mutateImageContainerTemplate := os.Getenv(mutateImageContainerTemplateEnvVar); mutateImageContainerTemplate != "" {
-		c.GitContainerTemplate = corev1.Container{}
-		if err := json.Unmarshal([]byte(mutateImageContainerTemplate), &c.MutateImageContainerTemplate); err != nil {
+	if imageProcessingContainerTemplate := os.Getenv(imageProcessingContainerTemplateEnvVar); imageProcessingContainerTemplate != "" {
+		c.ImageProcessingContainerTemplate = Step{}
+		if err := json.Unmarshal([]byte(imageProcessingContainerTemplate), &c.ImageProcessingContainerTemplate); err != nil {
 			return err
 		}
-		if c.MutateImageContainerTemplate.Image == "" {
-			c.MutateImageContainerTemplate.Image = mutateImageDefaultImage
+		if c.ImageProcessingContainerTemplate.Image == "" {
+			c.ImageProcessingContainerTemplate.Image = imageProcessingDefaultImage
 		}
 	}
 
 	// the dedicated environment variable for the image overwrites
-	// what is defined in the mutate image container template
-	if mutateImage := os.Getenv(mutateImageEnvVar); mutateImage != "" {
-		c.MutateImageContainerTemplate.Image = mutateImage
+	// what is defined in the image processing container template
+	if imageProcessingImage := os.Getenv(imageProcessingImageEnvVar); imageProcessingImage != "" {
+		c.ImageProcessingContainerTemplate.Image = imageProcessingImage
+	}
+
+	// set environment variable for vulnerability count limit
+	if vcStr := os.Getenv(VulnerabilityCountLimitEnvVar); vcStr != "" {
+		vc, err := strconv.Atoi(vcStr)
+		if err != nil {
+			return err
+		}
+		c.VulnerabilityCountLimit = vc
+	}
+
+	// set environment variable for executor type
+	if executor := os.Getenv(controllerBuildrunExecutorEnvVar); executor != "" {
+		c.BuildrunExecutor = executor
+	}
+
+	// Mark that the Git wrapper is suppose to use Git rewrite rule
+	if useGitRewriteRule := os.Getenv(useGitRewriteRule); useGitRewriteRule != "" {
+		c.GitRewriteRule = strings.ToLower(useGitRewriteRule) == "true"
 	}
 
 	if bundleContainerTemplate := os.Getenv(bundleContainerTemplateEnvVar); bundleContainerTemplate != "" {
-		c.BundleContainerTemplate = corev1.Container{}
+		c.BundleContainerTemplate = Step{}
 		if err := json.Unmarshal([]byte(bundleContainerTemplate), &c.BundleContainerTemplate); err != nil {
 			return err
 		}
@@ -266,6 +425,20 @@ func (c *Config) SetConfigFromEnv() error {
 	// the dedicated environment variable for the image overwrites what is defined in the bundle container template
 	if bundleImage := os.Getenv(bundleImageEnvVar); bundleImage != "" {
 		c.BundleContainerTemplate.Image = bundleImage
+	}
+
+	if waiterContainerTemplate := os.Getenv(waiterContainerTemplateEnvVar); waiterContainerTemplate != "" {
+		c.WaiterContainerTemplate = Step{}
+		if err := json.Unmarshal([]byte(waiterContainerTemplate), &c.WaiterContainerTemplate); err != nil {
+			return err
+		}
+		if c.WaiterContainerTemplate.Image == "" {
+			c.WaiterContainerTemplate.Image = waiterDefaultImage
+		}
+	}
+
+	if waiterImage := os.Getenv(waiterImageEnvVar); waiterImage != "" {
+		c.WaiterContainerTemplate.Image = waiterImage
 	}
 
 	if remoteArtifactsImage := os.Getenv(remoteArtifactsEnvVar); remoteArtifactsImage != "" {
@@ -327,6 +500,15 @@ func (c *Config) SetConfigFromEnv() error {
 	if terminationLogPath := os.Getenv(terminationLogPathEnvVar); terminationLogPath != "" {
 		c.TerminationLogPath = terminationLogPath
 	}
+
+	if forbiddenNames := os.Getenv(forbiddenEnvVarNamesEnvVar); forbiddenNames != "" {
+		entries := strings.Split(forbiddenNames, ",")
+		for i, entry := range entries {
+			entries[i] = strings.TrimSpace(entry)
+		}
+		c.ForbiddenEnvVarNames = entries
+	}
+	env.SetForbiddenEnvVars(c.ForbiddenEnvVarNames)
 
 	return nil
 }

@@ -9,27 +9,44 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"path/filepath"
-	"strings"
+	"strconv"
 
-	"github.com/docker/cli/cli/config"
-	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
+	"github.com/google/go-containerregistry/pkg/v1/mutate"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
-	"github.com/shipwright-io/build/pkg/bundle"
 	"github.com/spf13/pflag"
+
+	"github.com/shipwright-io/build/pkg/bundle"
+	"github.com/shipwright-io/build/pkg/image"
+	"github.com/shipwright-io/build/pkg/util"
 )
 
-var flagValues struct {
-	image      string
-	target     string
-	secretPath string
+type settings struct {
+	help                      bool
+	image                     string
+	prune                     bool
+	target                    string
+	secretPath                string
+	resultFileImageDigest     string
+	resultFileSourceTimestamp string
+	showListing               bool
 }
 
+var flagValues settings
+
 func init() {
+	// Explicitly define the help flag so that --help can be invoked and returns status code 0
+	pflag.BoolVar(&flagValues.help, "help", false, "Print the help")
+
+	// Main flags of the bundle step
 	pflag.StringVar(&flagValues.image, "image", "", "Location of the bundle image (mandatory)")
 	pflag.StringVar(&flagValues.target, "target", "/workspace/source", "The target directory to place the code")
+	pflag.StringVar(&flagValues.resultFileImageDigest, "result-file-image-digest", "", "A file to write the image digest")
+	pflag.StringVar(&flagValues.resultFileSourceTimestamp, "result-file-source-timestamp", "", "A file to write the source timestamp")
+
 	pflag.StringVar(&flagValues.secretPath, "secret-path", "", "A directory that contains access credentials (optional)")
+	pflag.BoolVar(&flagValues.prune, "prune", false, "Delete bundle image from registry after it was pulled")
+	pflag.BoolVar(&flagValues.showListing, "show-listing", false, "Print file listing of files unpacked from the bundle")
 }
 
 func main() {
@@ -40,85 +57,102 @@ func main() {
 
 // Do is the main entry point of the bundle command
 func Do(ctx context.Context) error {
+	flagValues = settings{}
 	pflag.Parse()
+
+	if val, ok := os.LookupEnv("BUNDLE_SHOW_LISTING"); ok {
+		flagValues.showListing, _ = strconv.ParseBool(val)
+	}
+
+	if flagValues.help {
+		pflag.Usage()
+		return nil
+	}
 
 	if flagValues.image == "" {
 		return fmt.Errorf("mandatory flag --image is not set")
 	}
 
-	ref, err := name.ParseReference(flagValues.image)
+	// check the endpoint, if hostname extraction fails, ignore that failure
+	if hostname, port, err := image.ExtractHostnamePort(flagValues.image); err == nil {
+		if !util.TestConnection(hostname, port, 9) {
+			log.Printf("Warning: a connection test to %s:%d failed. The operation will likely fail.\n", hostname, port)
+		}
+	}
+
+	ref, err := image.ParseReference(flagValues.image, true)
 	if err != nil {
 		return err
 	}
 
-	auth, err := resolveAuthBasedOnTarget(ref)
+	options, auth, err := image.GetOptions(ctx, ref, true, flagValues.secretPath, "Shipwright Build")
 	if err != nil {
 		return err
 	}
 
 	log.Printf("Pulling image %q", ref)
-	if err := bundle.PullAndUnpack(
-		ref,
-		flagValues.target,
-		remote.WithContext(ctx),
-		remote.WithAuth(auth)); err != nil {
+	desc, err := remote.Get(ref, options...)
+	if err != nil {
+		return err
+	}
+
+	img, err := desc.Image()
+	if err != nil {
+		return err
+	}
+
+	rc := mutate.Extract(img)
+	defer rc.Close()
+
+	unpackDetails, err := bundle.Unpack(rc, flagValues.target)
+	if err != nil {
 		return err
 	}
 
 	log.Printf("Image content was extracted to %s\n", flagValues.target)
-	return nil
-}
-
-func resolveAuthBasedOnTarget(ref name.Reference) (authn.Authenticator, error) {
-	// In case no secret is mounted, use anonymous
-	if flagValues.secretPath == "" {
-		log.Printf("No access credentials provided, using anonymous mode")
-		return authn.Anonymous, nil
+	if flagValues.showListing {
+		// ignore any errors when walking through the file system, the listing is only for informational purposes
+		_ = util.ListFiles(log.Writer(), flagValues.target)
 	}
 
-	// Read the registry credentials from the well-known location
-	file, err := os.Open(filepath.Join(flagValues.secretPath, ".dockerconfigjson"))
+	digest, err := img.Digest()
 	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-
-	cf, err := config.LoadFromReader(file)
-	if err != nil {
-		return nil, err
+		return fmt.Errorf("failed to retrieve digest from bundle image: %w", err)
 	}
 
-	// Look-up the respective registry server inside the credentials
-	registryName := ref.Context().RegistryStr()
-	if registryName == name.DefaultRegistry {
-		registryName = authn.DefaultAuthKey
+	if flagValues.resultFileImageDigest != "" {
+		// #nosec G306 the file must be readable by build steps that potentially run as a different user
+		if err = os.WriteFile(flagValues.resultFileImageDigest, []byte(digest.String()), 0644); err != nil {
+			return err
+		}
 	}
 
-	authConfig, err := cf.GetAuthConfig(registryName)
-	if err != nil {
-		return nil, err
+	if flagValues.resultFileSourceTimestamp != "" {
+		if unpackDetails.MostRecentFileTimestamp != nil {
+			// #nosec G306 the file must be readable by build steps that potentially run as a different user
+			if err = os.WriteFile(flagValues.resultFileSourceTimestamp, []byte(strconv.FormatInt(unpackDetails.MostRecentFileTimestamp.Unix(), 10)), 0644); err != nil {
+				return err
+			}
+
+		} else {
+			log.Printf("Unable to determine source timestamp of content in %s\n", flagValues.target)
+		}
 	}
 
-	// Return an error in case the credentials do not match the desired
-	// registry and list all servers that actually are available
-	if authConfig.ServerAddress != registryName {
-		var servers []string
-		for name := range cf.GetAuthConfigs() {
-			servers = append(servers, name)
+	if flagValues.prune {
+		// Some container registry implementations, i.e. library/registry:2 will fail to
+		// delete the image when there is no image digest given. Use image digest from the
+		// image pulling to construct an image name including tag and digest.
+		ref, err = name.NewDigest(fmt.Sprintf("%s@%s", ref.Name(), digest.String()), name.Insecure)
+		if err != nil {
+			return err
 		}
 
-		return nil, fmt.Errorf("failed to find registry credentials for %s, credentials are available for: %s",
-			registryName,
-			strings.Join(servers, ", "),
-		)
+		log.Printf("Deleting image %q", ref)
+		if err := image.Delete(ref, options, *auth); err != nil {
+			return err
+		}
 	}
 
-	log.Printf("Using provided access credentials for %s", registryName)
-	return authn.FromConfig(authn.AuthConfig{
-		Username:      authConfig.Username,
-		Password:      authConfig.Password,
-		Auth:          authConfig.Auth,
-		IdentityToken: authConfig.IdentityToken,
-		RegistryToken: authConfig.RegistryToken,
-	}), nil
+	return nil
 }

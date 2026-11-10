@@ -1,172 +1,296 @@
-on: 
-    pull_request:
-      branches:
-      - main
-      - master
-    push:
-      branches: 
-      - main
-      - master
+# Primary CI workflow for unit, integration, and e2e tests.
+#
+# Note: The `bump-tekton-lts.sh` script relies on the RETAIN-COMMENT comment being present. Take
+# care to ensure this comment is not removed.
+
 name: Unit, Integration, and E2E Tests
+on:
+  pull_request:
+    paths-ignore:
+    - OWNERS
+    - 'README.md'
+    - 'docs/**'
+    branches:
+    - main
+    - "release-v*" # release branches
+  push:
+    paths-ignore:
+    - 'README.md'
+    - 'docs/**'
+    - OWNERS
+    branches:
+    - main
+    - "release-v*" # release branches
+
 jobs:
-    unit:
-        runs-on: ubuntu-latest
-        steps:
-        - name: Install Go
-          uses: actions/setup-go@v2
-          with:
-            go-version: 1.16.x
-        - name: Check out code
-          uses: actions/checkout@v2
-        - name: Build
-          run: make build
-        - name: Test
-          run: make test-unit-coverage
-    integration:
-        strategy:
-          fail-fast: false
-          matrix:
-            kubernetes:
-              # Only v1.20 is currently enabled because of the flakiness in the tests, specifically API calls failing with "etcdserver: request timed out"
-              #- v1.17.17
-              #- v1.18.19
-              #- v1.19.11
-              - v1.20.7
-          max-parallel: 1
-        runs-on: ubuntu-latest
-        steps:
-        - name: Install Go
-          uses: actions/setup-go@v2
-          with:
-            go-version: 1.16.x
-        - name: Install Ko
-          uses: imjasonh/setup-ko@20b7695b536c640edfafdd378d96c760460f29d6
-        - name: Check out code
-          uses: actions/checkout@v2
-        - name: Install kubectl
-          uses: azure/setup-kubectl@v1
-          with:
-            version: ${{ matrix.kubernetes }}
-        - name: Create kind cluster
-          uses: helm/kind-action@v1.2.0
-          with:
-            version: v0.11.1
-            node_image: kindest/node:${{ matrix.kubernetes }}
-            cluster_name: kind
-            wait: 120s
-        - name: Verify kind cluster
-          run: |
-            echo "# Using KinD context..."
-            kubectl config use-context "kind-kind"
-            echo "# KinD nodes:"
-            kubectl get nodes
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v6
+      - name: Login to container registry
+        run: echo ${{ secrets.GITHUB_TOKEN }} | docker login -u ${{ github.repository_owner }} --password-stdin ghcr.io
+      - name: Install Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.26.x'
+          cache: true
+          check-latest: true
+      - name: Install Trivy
+        run: make install-trivy
+      - name: Build
+        run: make build
+      - name: Test
+        run: make test-unit-coverage
 
-            NODE_STATUS=$(kubectl get node kind-control-plane -o json | jq -r .'status.conditions[] | select(.type == "Ready") | .status')
-            if [ "${NODE_STATUS}" != "True" ]; then
-              echo "# Node is not ready:"
-              kubectl describe node kind-control-plane
+  test-install-spruce:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v6
+      - name: Test Spruce installer
+        run: make test-install-spruce
 
-              echo "# Pods:"
-              kubectl get pod -A
-              echo "# Events:"
-              kubectl get events -A
+  test-docker-build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      max-parallel: 4
+      matrix:
+        image:
+          - base
+          - git
+          - image-processing
+          - waiter
+        include:
+          - image: git
+            dockerfile: Dockerfile.ubi9
+    steps:
+      - uses: actions/checkout@v6
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+      - name: Login to container registry
+        run: echo ${{ secrets.GITHUB_TOKEN }} | docker login -u ${{ github.repository_owner }} --password-stdin ghcr.io
+      - name: Build Image
+        working-directory: images/${{ matrix.image }}
+        run: |
+          BUILD_IMAGE="registry.access.redhat.com/ubi9-minimal:latest"
+          TAG=latest
+          NAMESPACE=$(tr '[:upper:]' '[:lower:]' <<<${{ github.repository_owner }})
+          IMAGE=test-build/base-${{ matrix.image }} \
+          NAMESPACE="${NAMESPACE}" \
+          TAG=${TAG} BUILD_IMAGE=$BUILD_IMAGE \
+          DOCKERFILE=${{ matrix.dockerfile || 'Dockerfile' }} \
+          docker buildx bake --file ../docker-bake.hcl
 
-              exit 1
-            fi
-        - name: Install Tekton
-          run: |
-            make kind-tekton
-            kubectl -n tekton-pipelines rollout status deployment tekton-pipelines-controller --timeout=1m
-            kubectl -n tekton-pipelines rollout status deployment tekton-pipelines-webhook --timeout=1m
-        - name: Test
-          run: |
-            export GIT_CONTAINER_IMAGE="$(KO_DOCKER_REPO=kind.local ko publish ./cmd/git)"
-            make test-integration
-    e2e:
-        strategy:
-          fail-fast: false
-          matrix:
-            kubernetes:
-              # Only v1.20 is currently enabled because of the flakiness in the tests, specifically API calls failing with "etcdserver: request timed out"
-              #- v1.17.17
-              #- v1.18.19
-              #- v1.19.11
-              - v1.20.7
-          max-parallel: 2
-        runs-on: ubuntu-latest
-        steps:
-        - name: Install Go
-          uses: actions/setup-go@v2
-          with:
-            go-version: 1.16.x
-        - name: Check out code
-          uses: actions/checkout@v2
-        - name: Install kubectl
-          uses: azure/setup-kubectl@v1
-          with:
-            version: ${{ matrix.kubernetes }}
-        - name: Create kind cluster
-          uses: helm/kind-action@v1.2.0
-          with:
-            version: v0.11.1
-            node_image: kindest/node:${{ matrix.kubernetes }}
-            cluster_name: kind
-            config: test/kind/config.yaml
-            wait: 120s
-        - name: Verify kind cluster
-          run: |
-            echo "# Using KinD context..."
-            kubectl config use-context "kind-kind"
-            echo "# KinD nodes:"
-            kubectl get nodes
+  integration:
+    strategy:
+      fail-fast: false
+      matrix:
+        compat:
+          # oldest supported Kubernetes and Tekton LTS that exists at the time of our planned next release
+          - kubernetes: v1.34.11
+            tekton: v1.6.7
+          # newest supported Kubernetes and Tekton LTS that exists at the time of our planned next release
+          - kubernetes: v1.37.0
+            tekton: v1.15.2 # RETAIN-COMMENT: TEKTON_NEWEST_LTS
+      max-parallel: 4
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v6
+      - name: Install Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.26.x'
+          cache: true
+          check-latest: true
+      - name: Install Ko
+        uses: ko-build/setup-ko@v0.10
+        with:
+          version: v0.19.1
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v5
+        with:
+          version: ${{ matrix.compat.kubernetes }}
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+        with:
+          version: v0.33.0
+          node_image: kindest/node:${{ matrix.compat.kubernetes }}
+          cluster_name: kind
+          wait: 120s
+      - name: Verify kind cluster
+        run: |
+          echo "# Using KinD context..."
+          kubectl config use-context "kind-kind"
+          echo "# KinD nodes:"
+          kubectl get nodes
 
-            NODE_STATUS=$(kubectl get node kind-control-plane -o json | jq -r .'status.conditions[] | select(.type == "Ready") | .status')
-            if [ "${NODE_STATUS}" != "True" ]; then
-              echo "# Node is not ready:"
-              kubectl describe node kind-control-plane
+          NODE_STATUS=$(kubectl get node kind-control-plane -o json | jq -r .'status.conditions[] | select(.type == "Ready") | .status')
+          if [ "${NODE_STATUS}" != "True" ]; then
+            echo "# Node is not ready:"
+            kubectl describe node kind-control-plane
 
-              echo "# Pods:"
-              kubectl get pod -A
-              echo "# Events:"
-              kubectl get events -A
-
-              exit 1
-            fi
-        - name: Install Tekton
-          run: |
-            make kind-tekton
-            kubectl -n tekton-pipelines rollout status deployment tekton-pipelines-controller --timeout=1m
-            kubectl -n tekton-pipelines rollout status deployment tekton-pipelines-webhook --timeout=1m
-        - name: Install Registry
-          run: |
-            kubectl apply -f test/data/registry.yaml
-            kubectl -n registry rollout status deployment registry --timeout=1m
-        - name: Install Ko
-          uses: imjasonh/setup-ko@20b7695b536c640edfafdd378d96c760460f29d6
-        - name: Install Shipwright Build
-          run: |
-            make install-controller-kind
-            kubectl -n shipwright-build rollout status deployment shipwright-build-controller --timeout=1m || true
-        - name: Test
-          run: |
-            export TEST_NAMESPACE=shipwright-build
-            export TEST_IMAGE_REPO=registry.registry.svc.cluster.local:32222/shipwright-io/build-e2e
-            make test-e2e
-        - name: Build controller logs
-          if: ${{ failure() }}
-          run: |
             echo "# Pods:"
-            kubectl -n shipwright-build get pod
-            PODS=$(kubectl -n shipwright-build get pod -o json)
-            POD_NAME=$(echo "${PODS}" | jq -r '.items[] | select(.metadata.name | startswith("shipwright-build-controller-")) | .metadata.name')
-            if [ "${POD_NAME}" != "" ]; then
-              RESTART_COUNT=$(echo "${PODS}" | jq -r ".items[] | select(.metadata.name == \"${POD_NAME}\") | .status.containerStatuses[0].restartCount")
-              if [ "${RESTART_COUNT}" != "0" ]; then
-                echo "# Previous logs:"
-                kubectl -n shipwright-build logs "${POD_NAME}" --previous || true
-              fi
-              echo "# Logs:"
-              kubectl -n shipwright-build logs "${POD_NAME}"
-            else
-              echo "# Pod is missing, there are no logs to retrieve, bailing out..."
+            kubectl get pod -A
+            echo "# Events:"
+            kubectl get events -A
+
+            exit 1
+          fi
+      - name: Install Tekton
+        env:
+          TEKTON_VERSION: ${{ matrix.compat.tekton }}
+        run: |
+          make kind-tekton
+          if ! kubectl -n tekton-pipelines rollout status deployment tekton-pipelines-controller --timeout=3m; then
+            echo "[ERROR] Tekton installation did not complete. Debug info:"
+            kubectl -n tekton-pipelines get pod -o wide
+            exit 1
+          fi
+          kubectl -n tekton-pipelines rollout status deployment tekton-pipelines-webhook --timeout=3m
+      - name: Test
+        run: |
+          # host.docker.internal does not work in a GitHub action
+          docker exec kind-control-plane bash -c "echo '172.17.0.1 host.docker.internal' >>/etc/hosts"
+
+          # Build and load the Git and Bundle image
+          export GIT_CONTAINER_IMAGE="$(KO_DOCKER_REPO=kind.local ko publish ./cmd/git)"
+          export BUNDLE_CONTAINER_IMAGE="$(KO_DOCKER_REPO=kind.local ko publish ./cmd/bundle)"
+          export IMAGE_PROCESSING_CONTAINER_IMAGE="$(KO_DOCKER_REPO=kind.local ko publish ./cmd/image-processing)"
+
+          make test-integration
+      - name: Test-PipelineRun
+        run: make test-integration-pipelinerun
+
+  e2e:
+    strategy:
+      fail-fast: false
+      matrix:
+        compat:
+          # oldest supported Kubernetes and Tekton LTS that exists at the time of our planned next release
+          - kubernetes: v1.34.11
+            tekton: v1.6.7
+          # newest supported Kubernetes and Tekton LTS that exists at the time of our planned next release
+          - kubernetes: v1.37.0
+            tekton: v1.15.2 # RETAIN-COMMENT: TEKTON_NEWEST_LTS
+      max-parallel: 4
+    runs-on: oracle-vm-16cpu-64gb-x86-64
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v6
+      - name: Install Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.26.x'
+          cache: true
+          check-latest: true
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v5
+        with:
+          version: ${{ matrix.compat.kubernetes }}
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+        with:
+          version: v0.33.0
+          node_image: kindest/node:${{ matrix.compat.kubernetes }}
+          cluster_name: kind
+          config: test/kind/config_three_node.yaml
+          wait: 120s
+      - name: Verify kind cluster
+        run: |
+          echo "# Using KinD context..."
+          kubectl config use-context "kind-kind"
+          echo "# KinD nodes:"
+          kubectl get nodes
+
+          for nodename in $(kubectl get nodes -o name); do
+            kubectl wait --for=condition=Ready=true ${nodename} --timeout=60s
+            NODE_STATUS=$(kubectl get ${nodename} -o json | jq -r .'status.conditions[] | select(.type == "Ready") | .status')
+            if [ "${NODE_STATUS}" != "True" ]; then
+              echo "# Node is not ready:"
+              kubectl describe ${nodename}
+
+              echo "# Pods:"
+              kubectl get pod -A
+              echo "# Events:"
+              kubectl get events -A
+
+              exit 1
             fi
+          done
+      - name: Install Tekton
+        env:
+          TEKTON_VERSION: ${{ matrix.compat.tekton }}
+        run: |
+          make kind-tekton
+          if ! kubectl -n tekton-pipelines rollout status deployment tekton-pipelines-controller --timeout=3m; then
+            echo "[ERROR] Tekton installation did not complete. Debug info:"
+            kubectl -n tekton-pipelines get pod -o wide
+            exit 1
+          fi
+          kubectl -n tekton-pipelines rollout status deployment tekton-pipelines-webhook --timeout=3m
+      - name: Install Registry
+        run: |
+          kubectl apply -f test/data/registry.yaml
+          kubectl -n registry rollout status deployment registry --timeout=1m
+      - name: Install Ko
+        uses: ko-build/setup-ko@v0.10
+        with:
+          version: v0.19.1
+      - name: Install Shipwright Build
+        run: |
+          make install-controller-kind
+          kubectl -n shipwright-build rollout status deployment shipwright-build-controller --timeout=1m || true
+          kubectl -n shipwright-build rollout status deployment shipwright-build-webhook --timeout=1m || true
+      - name: Test
+        run: |
+          kubectl create namespace shp-e2e
+          export TEST_NAMESPACE=shp-e2e
+          export TEST_IMAGE_REPO=registry.registry.svc.cluster.local:32222/shipwright-io/build-e2e
+          export TEST_IMAGE_REPO_INSECURE=true
+          export TEST_E2E_FLAGS="-r --procs 8 --randomize-all --timeout=1h --trace --vv"
+          export TEST_E2E_TIMEOUT_MULTIPLIER=2
+          make test-e2e
+      - name: Test-PipelineRun
+        env:
+          TEST_NAMESPACE: shp-e2e
+          TEST_IMAGE_REPO: registry.registry.svc.cluster.local:32222/shipwright-io/build-e2e
+          TEST_IMAGE_REPO_INSECURE: true
+          TEST_E2E_SERVICEACCOUNT_NAME: pipeline
+          TEST_E2E_TIMEOUT_MULTIPLIER: 1
+        run: make test-e2e-pipelinerun
+      - name: Build controller logs
+        if: ${{ failure() }}
+        run: |
+          echo "# Pods:"
+          kubectl -n shipwright-build get pod
+          PODS=$(kubectl -n shipwright-build get pod -o json)
+          POD_NAME=$(echo "${PODS}" | jq -r '.items[] | select(.metadata.name | startswith("shipwright-build-controller-")) | .metadata.name')
+          if [ "${POD_NAME}" != "" ]; then
+            RESTART_COUNT=$(echo "${PODS}" | jq -r ".items[] | select(.metadata.name == \"${POD_NAME}\") | .status.containerStatuses[0].restartCount")
+            if [ "${RESTART_COUNT}" != "0" ]; then
+              echo "# Build Controller Previous logs:"
+              kubectl -n shipwright-build logs "${POD_NAME}" --previous || true
+            fi
+            echo "# Build Controller Logs:"
+            kubectl -n shipwright-build logs "${POD_NAME}"
+          else
+            echo "# Pod is missing, there are no logs to retrieve, bailing out..."
+          fi
+
+          WEBHOOK_POD_NAME=$(echo "${PODS}" | jq -r '.items[] | select(.metadata.name | startswith("shipwright-build-webhook-")) | .metadata.name')
+          if [ "${WEBHOOK_POD_NAME}" != "" ]; then
+            RESTART_COUNT=$(echo "${PODS}" | jq -r ".items[] | select(.metadata.name == \"${WEBHOOK_POD_NAME}\") | .status.containerStatuses[0].restartCount")
+            if [ "${RESTART_COUNT}" != "0" ]; then
+              echo "# Build Webhook Previous logs:"
+              kubectl -n shipwright-build logs "${WEBHOOK_POD_NAME}" --previous || true
+            fi
+            echo "# Build Webhook Logs:"
+            kubectl -n shipwright-build logs "${WEBHOOK_POD_NAME}"
+          else
+            echo "# Pod is missing, there are no logs to retrieve, bailing out..."
+          fi

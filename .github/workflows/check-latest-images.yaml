@@ -1,0 +1,68 @@
+name: Update images in sample build strategies
+on:
+  schedule:
+  - cron: '0 0 * * *'
+  issue_comment:
+    types: [created, edited]
+jobs:
+  check-new-versions:
+    if: ${{ contains(github.event.comment.body, '/rebase') || (github.event_name == 'schedule' && github.repository == 'shipwright-io/build') }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - image: gcr.io/kaniko-project/executor
+            latest-release-url: https://api.github.com/repos/GoogleContainerTools/kaniko/releases/latest
+          - image: moby/buildkit
+            latest-release-url: https://api.github.com/repos/moby/buildkit/releases/latest
+          - image: quay.io/containers/buildah
+            latest-release-url: https://quay.io/api/v1/repository/containers/buildah/tag/
+          - image: docker.io/paketobuildpacks/builder-jammy-full
+            latest-release-url: https://hub.docker.com/v2/repositories/paketobuildpacks/builder-jammy-full/tags
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+      - name: Check and modify ${{ matrix.image }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE: ${{ matrix.image }}
+          LATEST_RELEASE_URL: ${{ matrix.latest-release-url }}
+        run: |
+          for directory in docs pkg samples test; do hack/check-latest-images.sh ${IMAGE} ${LATEST_RELEASE_URL} ${directory}; done
+      - name: Check image change
+        run: |
+          echo "FROM=$(git diff --unified=0 | grep '^[-].*image: .*:' | head --lines=1 | cut --delimiter=':' --fields='3' | sed 's/[^[[:digit:].]//g')" >> $GITHUB_OUTPUT
+          echo "TO=$(git diff --unified=0 | grep '^[+].*image: .*:' | head --lines=1 | cut --delimiter=':' --fields='3' | sed 's/[^[[:digit:].]//g')" >> $GITHUB_OUTPUT
+        id: image-diff
+      - name: Create pull request
+        uses: peter-evans/create-pull-request@v8
+        with:
+          # Branch details:
+          branch: ${{ matrix.image }}
+          delete-branch: true
+
+          # Commit details
+          author: github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>
+          commit-message: Bump ${{ matrix.image }} from ${{ steps.image-diff.outputs.FROM }} to ${{ steps.image-diff.outputs.TO }}
+          sign-commits: true
+          signoff: true
+
+          # PR details
+          title: Bump ${{ matrix.image }} from ${{ steps.image-diff.outputs.FROM }} to ${{ steps.image-diff.outputs.TO }}
+          body: |
+            # Changes
+            Bumps ${{ matrix.image }} from ${{ steps.image-diff.outputs.FROM }} to ${{ steps.image-diff.outputs.TO }}.
+
+            You can trigger a rebase manually by commenting `/rebase` and resolve any conflicts with this PR.
+
+            # Submitter Checklist
+            - [ ] Includes tests if functionality changed/was added
+            - [ ] Includes docs if changes are user-facing
+            - [x] [Set a kind label on this PR](https://prow.k8s.io/command-help#kind)
+            - [x] Release notes block has been filled in, or marked NONE
+
+            # Release Notes
+            ```release-note
+            NONE
+            ```
+          labels: kind/dependency-change

@@ -1,0 +1,123 @@
+// Copyright The Shipwright Contributors
+//
+// SPDX-License-Identifier: Apache-2.0
+
+package e2e_test
+
+import (
+	"fmt"
+	"os"
+	"strconv"
+
+	"github.com/google/go-containerregistry/pkg/name"
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+
+	buildapialpha "github.com/shipwright-io/build/pkg/apis/build/v1alpha1"
+)
+
+var _ = Describe("Using One-Off Builds", Label("OneOffBuild"), func() {
+
+	insecure := false
+	value, found := os.LookupEnv(EnvVarImageRepoInsecure)
+	if found {
+		var err error
+		insecure, err = strconv.ParseBool(value)
+		Expect(err).ToNot(HaveOccurred())
+	}
+
+	var (
+		testID string
+		err    error
+
+		buildRun *buildapialpha.BuildRun
+	)
+
+	AfterEach(func() {
+		if CurrentSpecReport().Failed() {
+			printTestFailureDebugInfo(testBuild, testBuild.Namespace, testID)
+
+		} else if buildRun != nil {
+			validateServiceAccountDeletion(buildRun, testBuild.Namespace)
+		}
+
+		if buildRun != nil {
+			Expect(testBuild.DeleteBR(buildRun.Name)).To(Succeed())
+			buildRun = nil
+		}
+	})
+
+	Context("Embed BuildSpec in BuildRun", func() {
+		var outputImage name.Reference
+
+		BeforeEach(func() {
+			testID = generateTestID("onoff")
+
+			outputImage, err = name.ParseReference(fmt.Sprintf("%s/%s:%s",
+				os.Getenv(EnvVarImageRepo),
+				testID,
+				"latest",
+			))
+			Expect(err).ToNot(HaveOccurred())
+		})
+
+		It("should build an image using Buildpacks and a Git source", Label("Buildpacks", "GitSource"), func() {
+			buildRun, err = NewBuildRunPrototype().
+				Namespace(testBuild.Namespace).
+				Name(testID).
+				WithBuildSpec(NewBuildPrototype().
+					ClusterBuildStrategy("buildpacks-v3").
+					Namespace(testBuild.Namespace).
+					Name(testID).
+					SourceGit("https://github.com/shipwright-io/sample-go.git").
+					SourceContextDir("source-build").
+					OutputImage(outputImage.String()).
+					OutputImageCredentials(os.Getenv(EnvVarImageRepoSecret)).
+					OutputImageInsecure(insecure).
+					BuildSpec()).
+				Create()
+			Expect(err).ToNot(HaveOccurred())
+			validateBuildRunToSucceed(testBuild, buildRun)
+		})
+
+		It("should build an image using Buildah and a Git source", Label("Buildah", "GitSource"), func() {
+			buildRun, err = NewBuildRunPrototype().
+				Namespace(testBuild.Namespace).
+				Name(testID).
+				WithBuildSpec(NewBuildPrototype().
+					ClusterBuildStrategy("buildah-shipwright-managed-push").
+					Namespace(testBuild.Namespace).
+					Name(testID).
+					SourceGit("https://github.com/shipwright-io/sample-go.git").
+					SourceContextDir("docker-build").
+					Dockerfile("Dockerfile").
+					ArrayParamValue("registries-insecure", outputImage.Context().RegistryStr()).
+					OutputImage(outputImage.String()).
+					OutputImageCredentials(os.Getenv(EnvVarImageRepoSecret)).
+					OutputImageInsecure(insecure).
+					BuildSpec()).
+				Create()
+			Expect(err).ToNot(HaveOccurred())
+			validateBuildRunToSucceed(testBuild, buildRun)
+		})
+
+		It("should build an image using Buildpacks and a bundle source", Label("Buildpacks", "LocalSource"), func() {
+			buildRun, err = NewBuildRunPrototype().
+				Namespace(testBuild.Namespace).
+				Name(testID).
+				WithBuildSpec(NewBuildPrototype().
+					ClusterBuildStrategy("buildpacks-v3").
+					Namespace(testBuild.Namespace).
+					Name(testID).
+					SourceBundle("ghcr.io/shipwright-io/sample-go/source-bundle:latest").
+					SourceContextDir("source-build").
+					OutputImage(outputImage.String()).
+					OutputImageCredentials(os.Getenv(EnvVarImageRepoSecret)).
+					OutputImageInsecure(insecure).
+					BuildSpec()).
+				Create()
+			Expect(err).ToNot(HaveOccurred())
+			validateBuildRunToSucceed(testBuild, buildRun)
+		})
+	})
+})

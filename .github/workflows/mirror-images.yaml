@@ -6,20 +6,31 @@ on:
   workflow_dispatch:  # Manual trigger
 
 jobs:
-  build:
+  mirror-images:
     if: ${{ github.repository == 'shipwright-io/build' }}
     runs-on: ubuntu-latest
 
     steps:
-      - name: Install crane
-        run: curl --fail --silent --location https://github.com/google/go-containerregistry/releases/download/v0.6.0/go-containerregistry_Linux_x86_64.tar.gz | tar -xzf - -C /usr/local/bin crane
-
-      - name: Login to container registry
-        run: echo "${{ secrets.REGISTRY_PASSWORD }}" | crane auth login -u "${{ secrets.REGISTRY_USERNAME }}" --password-stdin quay.io
+      - uses: imjasonh/setup-crane@feee3b6bb0d4c68370f256a4502498c9227e5c6b
 
       - name: Mirror images
+        env:
+          REPO: ghcr.io/${{ github.repository_owner }}/shipwright-samples
         run: |
-          crane cp golang:1.16 quay.io/shipwright-samples/golang:1.16
-          crane cp maven:3-jdk-8-openj9 quay.io/shipwright-samples/maven:3-jdk-8-openj9
-          crane cp openliberty/open-liberty:kernel-java8-openj9-ubi quay.io/shipwright-samples/open-liberty:kernel-java8-openj9-ubi
-          crane cp node:12 quay.io/shipwright-samples/node:12
+          for IMAGE in \
+            library/golang:1.24 \
+            library/golang:1.25 \
+            library/golang:1.26 \
+            library/maven:3-jdk-8-openj9 \
+            library/node:20 \
+            library/node:22 \
+            library/node:24 \
+            library/python:3.9 \
+            library/python:3.10 \
+            library/python:3.11 \
+            library/python:3.12 \
+            library/python:3.13 \
+            openliberty/open-liberty:kernel-java8-openj9-ubi \
+            ; do
+            crane cp "${IMAGE}" "${REPO}/$(cut -d/ -f2 <<<"${IMAGE}")"
+          done

@@ -12,7 +12,6 @@ import (
 	v1alpha1 "github.com/shipwright-io/build/pkg/apis/build/v1alpha1"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	labels "k8s.io/apimachinery/pkg/labels"
-	schema "k8s.io/apimachinery/pkg/runtime/schema"
 	types "k8s.io/apimachinery/pkg/types"
 	watch "k8s.io/apimachinery/pkg/watch"
 	testing "k8s.io/client-go/testing"
@@ -24,9 +23,9 @@ type FakeBuilds struct {
 	ns   string
 }
 
-var buildsResource = schema.GroupVersionResource{Group: "shipwright.io", Version: "v1alpha1", Resource: "builds"}
+var buildsResource = v1alpha1.SchemeGroupVersion.WithResource("builds")
 
-var buildsKind = schema.GroupVersionKind{Group: "shipwright.io", Version: "v1alpha1", Kind: "Build"}
+var buildsKind = v1alpha1.SchemeGroupVersion.WithKind("Build")
 
 // Get takes name of the build, and returns the corresponding build object, and an error if there is any.
 func (c *FakeBuilds) Get(ctx context.Context, name string, options v1.GetOptions) (result *v1alpha1.Build, err error) {
@@ -105,7 +104,7 @@ func (c *FakeBuilds) UpdateStatus(ctx context.Context, build *v1alpha1.Build, op
 // Delete takes name of the build and deletes it. Returns an error if one occurs.
 func (c *FakeBuilds) Delete(ctx context.Context, name string, opts v1.DeleteOptions) error {
 	_, err := c.Fake.
-		Invokes(testing.NewDeleteAction(buildsResource, c.ns, name), &v1alpha1.Build{})
+		Invokes(testing.NewDeleteActionWithOptions(buildsResource, c.ns, name, opts), &v1alpha1.Build{})
 
 	return err
 }

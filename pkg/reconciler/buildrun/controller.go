@@ -6,12 +6,14 @@ package buildrun
 
 import (
 	"context"
-	"github.com/tektoncd/pipeline/pkg/apis/pipeline/v1beta1"
-	"knative.dev/pkg/apis"
+	"fmt"
 
+	pipelineapi "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"knative.dev/pkg/apis"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/event"
@@ -21,22 +23,20 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 
-	buildv1alpha1 "github.com/shipwright-io/build/pkg/apis/build/v1alpha1"
+	buildapi "github.com/shipwright-io/build/pkg/apis/build/v1beta1"
 	"github.com/shipwright-io/build/pkg/config"
-	"github.com/shipwright-io/build/pkg/ctxlog"
 )
 
-type setOwnerReferenceFunc func(owner, object metav1.Object, scheme *runtime.Scheme) error
+type setOwnerReferenceFunc func(owner, object metav1.Object, scheme *runtime.Scheme, opts ...controllerutil.OwnerReferenceOption) error
 
 // Add creates a new BuildRun Controller and adds it to the Manager. The Manager will set fields on the Controller
 // and Start it when the Manager is Started.
-func Add(ctx context.Context, c *config.Config, mgr manager.Manager) error {
-	ctx = ctxlog.NewContext(ctx, "buildrun-controller")
-	return add(ctx, mgr, NewReconciler(ctx, c, mgr, controllerutil.SetControllerReference), c.Controllers.BuildRun.MaxConcurrentReconciles)
+func Add(_ context.Context, c *config.Config, mgr manager.Manager) error {
+	return add(mgr, NewReconciler(c, mgr, controllerutil.SetControllerReference), c.Controllers.BuildRun.MaxConcurrentReconciles, c)
 }
 
 // add adds a new Controller to mgr with r as the reconcile.Reconciler
-func add(ctx context.Context, mgr manager.Manager, r reconcile.Reconciler, maxConcurrentReconciles int) error {
+func add(mgr manager.Manager, r reconcile.Reconciler, maxConcurrentReconciles int, cfg *config.Config) error {
 	// Create the controller options
 	options := controller.Options{
 		Reconciler: r,
@@ -51,92 +51,161 @@ func add(ctx context.Context, mgr manager.Manager, r reconcile.Reconciler, maxCo
 		return err
 	}
 
-	predBuildRun := predicate.Funcs{
-		CreateFunc: func(e event.CreateEvent) bool {
-			o := e.Object.(*buildv1alpha1.BuildRun)
-
-			// The CreateFunc is also called when the controller is started and iterates over all objects. For those BuildRuns that have a TaskRun referenced already,
-			// we do not need to do a further reconciliation. BuildRun updates then only happen from the TaskRun.
-			return o.Status.LatestTaskRunRef == nil && o.Status.CompletionTime == nil
+	predBuildRun := predicate.TypedFuncs[*buildapi.BuildRun]{
+		CreateFunc: func(e event.TypedCreateEvent[*buildapi.BuildRun]) bool {
+			// The CreateFunc is also called when the controller is started and iterates over all objects. For those BuildRuns that have an executor referenced already,
+			// we do not need to do a further reconciliation. BuildRun updates then only happen from the TaskRun/PipelineRun.
+			return e.Object.Status.Executor == nil && e.Object.Status.CompletionTime == nil
 		},
-		UpdateFunc: func(e event.UpdateEvent) bool {
-			// Ignore updates to CR status in which case metadata.Generation does not change
-			o := e.ObjectOld.(*buildv1alpha1.BuildRun)
-			n := e.ObjectNew.(*buildv1alpha1.BuildRun)
-
-			// Avoid reconciling when for updates on the BuildRun the following takes place
-			// - the build.shipwright.io/name label is set
-			// - when a BuildRun already have a referenced TaskRun, but the latest version is not canceled
-			// - when a BuildRun have a completionTime set
+		UpdateFunc: func(e event.TypedUpdateEvent[*buildapi.BuildRun]) bool {
+			// Only reconcile a BuildRun update when
+			// - it is set to canceled
 			switch {
-			case o.GetLabels()[buildv1alpha1.LabelBuild] == "":
-				return false
-			case o.Status.LatestTaskRunRef != nil && !n.IsCanceled():
-				return false
-			case o.Status.CompletionTime != nil:
-				return false
+			case !e.ObjectOld.IsCanceled() && e.ObjectNew.IsCanceled():
+				return true
 			}
 
-			return e.MetaOld.GetGeneration() != e.MetaNew.GetGeneration()
+			return false
 		},
-		DeleteFunc: func(e event.DeleteEvent) bool {
+		DeleteFunc: func(_ event.TypedDeleteEvent[*buildapi.BuildRun]) bool {
 			// Never reconcile on deletion, there is nothing we have to do
 			return false
 		},
 	}
 
-	predTaskRun := predicate.Funcs{
-		UpdateFunc: func(e event.UpdateEvent) bool {
-			o := e.ObjectOld.(*v1beta1.TaskRun)
-			n := e.ObjectNew.(*v1beta1.TaskRun)
+	predTaskRun := predicate.TypedFuncs[*pipelineapi.TaskRun]{
+		UpdateFunc: func(e event.TypedUpdateEvent[*pipelineapi.TaskRun]) bool {
+			o := e.ObjectOld
+			n := e.ObjectNew
 
-			// Process an update event when the old TR resource is not yet started and the new TR resource got a
-			// condition of the type Succeeded
-			if o.Status.StartTime.IsZero() && n.Status.GetCondition(apis.ConditionSucceeded) != nil {
+			// Check for start time changes
+			if o.Status.StartTime.IsZero() && !n.Status.StartTime.IsZero() {
 				return true
 			}
 
-			// Process an update event for every change in the condition.Reason between the old and new TR resource
-			if o.Status.GetCondition(apis.ConditionSucceeded) != nil && n.Status.GetCondition(apis.ConditionSucceeded) != nil {
-				if o.Status.GetCondition(apis.ConditionSucceeded).Reason != n.Status.GetCondition(apis.ConditionSucceeded).Reason {
+			// Check for condition changes
+			oldCondition := o.Status.GetCondition(apis.ConditionSucceeded)
+			newCondition := n.Status.GetCondition(apis.ConditionSucceeded)
+
+			// New condition appeared
+			if oldCondition == nil && newCondition != nil {
+				return true
+			}
+
+			// Both conditions exist, check for changes
+			if oldCondition != nil && newCondition != nil {
+				// Always reconcile on failures
+				if newCondition.Status == corev1.ConditionFalse {
+					return true
+				}
+
+				// Check for status, reason, or message changes
+				if oldCondition.Status != newCondition.Status ||
+					oldCondition.Reason != newCondition.Reason ||
+					oldCondition.Message != newCondition.Message {
 					return true
 				}
 			}
+
 			return false
 		},
-		DeleteFunc: func(e event.DeleteEvent) bool {
-			o := e.Object.(*v1beta1.TaskRun)
-
+		DeleteFunc: func(e event.TypedDeleteEvent[*pipelineapi.TaskRun]) bool {
 			// If the TaskRun was deleted before completion, then we reconcile to update the BuildRun to a Failed status
-			return o.Status.CompletionTime == nil
+			return e.Object.Status.CompletionTime == nil
+		},
+	}
+
+	predPipelineRun := predicate.TypedFuncs[*pipelineapi.PipelineRun]{
+		UpdateFunc: func(e event.TypedUpdateEvent[*pipelineapi.PipelineRun]) bool {
+			o := e.ObjectOld
+			n := e.ObjectNew
+
+			// Check for start time changes
+			if o.Status.StartTime.IsZero() && !n.Status.StartTime.IsZero() {
+				return true
+			}
+
+			// Check for condition changes
+			oldCondition := o.Status.GetCondition(apis.ConditionSucceeded)
+			newCondition := n.Status.GetCondition(apis.ConditionSucceeded)
+
+			// New condition appeared
+			if oldCondition == nil && newCondition != nil {
+				return true
+			}
+
+			// Both conditions exist, check for changes
+			if oldCondition != nil && newCondition != nil {
+				// Always reconcile on failures
+				if newCondition.Status == corev1.ConditionFalse {
+					return true
+				}
+
+				// Check for status, reason, or message changes
+				if oldCondition.Status != newCondition.Status ||
+					oldCondition.Reason != newCondition.Reason ||
+					oldCondition.Message != newCondition.Message {
+					return true
+				}
+			}
+
+			return false
+		},
+		DeleteFunc: func(e event.TypedDeleteEvent[*pipelineapi.PipelineRun]) bool {
+			// If the PipelineRun was deleted before completion, then we reconcile to update the BuildRun to a Failed status
+			return e.Object.Status.CompletionTime == nil
 		},
 	}
 
 	// Watch for changes to primary resource BuildRun
-	if err = c.Watch(&source.Kind{Type: &buildv1alpha1.BuildRun{}}, &handler.EnqueueRequestForObject{}, predBuildRun); err != nil {
+	if err = c.Watch(source.Kind[*buildapi.BuildRun](mgr.GetCache(), &buildapi.BuildRun{}, &handler.TypedEnqueueRequestForObject[*buildapi.BuildRun]{}, predBuildRun)); err != nil {
 		return err
 	}
 
-	// enqueue Reconciles requests only for events where a TaskRun already exists and that is related
-	// to a BuildRun
-	return c.Watch(&source.Kind{Type: &v1beta1.TaskRun{}}, &handler.EnqueueRequestsFromMapFunc{
-		ToRequests: handler.ToRequestsFunc(func(o handler.MapObject) []reconcile.Request {
+	// Common handler for executor events
+	enqueueExecutorHandler := func(name, namespace string) []reconcile.Request {
+		return []reconcile.Request{
+			{
+				NamespacedName: types.NamespacedName{
+					Name:      name,
+					Namespace: namespace,
+				},
+			},
+		}
+	}
 
-			taskRun := o.Object.(*v1beta1.TaskRun)
-
+	// Watch for executor events based on configuration
+	// Only watch the executor type that is configured to be used
+	switch cfg.BuildrunExecutor {
+	case "TaskRun":
+		// Watch for TaskRun events
+		// enqueue Reconciles requests only for events where a TaskRun already exists and that is related
+		// to a BuildRun
+		if err = c.Watch(source.Kind(mgr.GetCache(), &pipelineapi.TaskRun{}, handler.TypedEnqueueRequestsFromMapFunc(func(_ context.Context, taskRun *pipelineapi.TaskRun) []reconcile.Request {
 			// check if TaskRun is related to BuildRun
-			if taskRun.GetLabels() == nil || taskRun.GetLabels()[buildv1alpha1.LabelBuildRun] == "" {
+			if taskRun.GetLabels() == nil || taskRun.GetLabels()[buildapi.LabelBuildRun] == "" {
 				return []reconcile.Request{}
 			}
-
-			return []reconcile.Request{
-				{
-					NamespacedName: types.NamespacedName{
-						Name:      taskRun.Name,
-						Namespace: taskRun.Namespace,
-					},
-				},
+			return enqueueExecutorHandler(taskRun.Name, taskRun.Namespace)
+		}), predTaskRun)); err != nil {
+			return err
+		}
+	case "PipelineRun":
+		// Watch for PipelineRun events
+		// enqueue Reconciles requests only for events where a PipelineRun already exists and that is related
+		// to a BuildRun
+		if err = c.Watch(source.Kind(mgr.GetCache(), &pipelineapi.PipelineRun{}, handler.TypedEnqueueRequestsFromMapFunc(func(_ context.Context, pipelineRun *pipelineapi.PipelineRun) []reconcile.Request {
+			// check if PipelineRun is related to BuildRun
+			if pipelineRun.GetLabels() == nil || pipelineRun.GetLabels()[buildapi.LabelBuildRun] == "" {
+				return []reconcile.Request{}
 			}
-		}),
-	}, predTaskRun)
+			return enqueueExecutorHandler(pipelineRun.Name, pipelineRun.Namespace)
+		}), predPipelineRun)); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("unsupported BuildrunExecutor: %s", cfg.BuildrunExecutor)
+	}
+
+	return nil
 }

@@ -5,13 +5,21 @@
 package integration_test
 
 import (
+	"bytes"
 	"fmt"
+	"net/http"
 	"testing"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
-	"github.com/shipwright-io/build/test/utils"
+	utils "github.com/shipwright-io/build/test/utils/v1beta1"
+)
+
+const (
+	BUILD    = "build-"
+	BUILDRUN = "buildrun-"
+	STRATEGY = "strategy-"
 )
 
 func TestIntegration(t *testing.T) {
@@ -22,9 +30,26 @@ func TestIntegration(t *testing.T) {
 // TODO: clean resources in cluster, e.g. mainly cluster-scope ones
 // TODO: clean each resource created per spec
 var (
-	tb  *utils.TestBuild
-	err error
+	tb            *utils.TestBuild
+	err           error
+	webhookServer *http.Server
+
+	controllerLogs *bytes.Buffer
 )
+
+var _ = BeforeSuite(func() {
+	webhookServer = utils.StartBuildWebhook()
+
+	var err error
+	controllerLogs, err = utils.StartBuildControllers()
+	Expect(err).ToNot(HaveOccurred())
+})
+
+var _ = AfterSuite(func() {
+	if webhookServer != nil {
+		utils.StopBuildWebhook(webhookServer)
+	}
+})
 
 var _ = BeforeEach(func() {
 	tb, err = utils.NewTestBuild()
@@ -37,30 +62,18 @@ var _ = BeforeEach(func() {
 		fmt.Printf("fail to create namespace: %v, with error: %v", tb.Namespace, err)
 	}
 
-	// We store a channel for each Build controller instance we start,
-	// so that we can nuke the instance later inside the AfterEach Ginkgo
-	// block
-	tb.StopBuildControllers, err = tb.StartBuildControllers()
-	if err != nil {
-		fmt.Println("fail to start the powerful Build controllers", err)
-	}
+	controllerLogs.Reset()
 })
 
 var _ = AfterEach(func() {
-	// Close the channel, meaning we nuke an instance of the Build
-	// operator
-	if tb.StopBuildControllers != nil {
-		close(tb.StopBuildControllers)
-	}
-
 	// Cleanup the namespace
 	if err := tb.DeleteNamespace(); err != nil {
 		fmt.Printf("failed to delete namespace: %v, with error: %v", tb.Namespace, err)
 	}
 
-	if CurrentGinkgoTestDescription().Failed && tb.BuildControllerLogBuffer != nil {
+	if CurrentSpecReport().Failed() {
 		// print operator logs
 		fmt.Println("\nLogs of the operator:")
-		fmt.Printf("%v\n", tb.BuildControllerLogBuffer)
+		fmt.Printf("%v\n", controllerLogs)
 	}
 })

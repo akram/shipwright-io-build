@@ -12,6 +12,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -22,7 +23,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 
-	build "github.com/shipwright-io/build/pkg/apis/build/v1alpha1"
+	buildapi "github.com/shipwright-io/build/pkg/apis/build/v1beta1"
 	"github.com/shipwright-io/build/pkg/config"
 	"github.com/shipwright-io/build/pkg/ctxlog"
 )
@@ -32,13 +33,13 @@ const (
 	name      string = "name"
 )
 
-type setOwnerReferenceFunc func(owner, object metav1.Object, scheme *runtime.Scheme) error
+type setOwnerReferenceFunc func(owner, object metav1.Object, scheme *runtime.Scheme, opts ...controllerutil.OwnerReferenceOption) error
 
 // Add creates a new Build Controller and adds it to the Manager. The Manager will set fields on the Controller
 // and Start it when the Manager is Started.
 func Add(ctx context.Context, c *config.Config, mgr manager.Manager) error {
 	ctx = ctxlog.NewContext(ctx, "build-controller")
-	return add(ctx, mgr, NewReconciler(ctx, c, mgr, controllerutil.SetControllerReference), c.Controllers.Build.MaxConcurrentReconciles)
+	return add(ctx, mgr, NewReconciler(c, mgr, controllerutil.SetControllerReference), c.Controllers.Build.MaxConcurrentReconciles)
 }
 
 // add adds a new Controller to mgr with r as the reconcile.Reconciler
@@ -57,133 +58,104 @@ func add(ctx context.Context, mgr manager.Manager, r reconcile.Reconciler, maxCo
 		return err
 	}
 
-	pred := predicate.Funcs{
-		UpdateFunc: func(e event.UpdateEvent) bool {
-			buildRunDeletionAnnotation := false
-			// Check if the AnnotationBuildRunDeletion annotation is updated
-			oldAnnot := e.MetaOld.GetAnnotations()
-			newAnnot := e.MetaNew.GetAnnotations()
-			if !reflect.DeepEqual(oldAnnot, newAnnot) {
-				if oldAnnot[build.AnnotationBuildRunDeletion] != newAnnot[build.AnnotationBuildRunDeletion] {
-					ctxlog.Debug(
-						ctx,
-						"updating predicated passed, the annotation was modified.",
-						namespace,
-						e.MetaNew.GetNamespace(),
-						name,
-						e.MetaNew.GetName(),
-					)
-					buildRunDeletionAnnotation = true
+	pred := predicate.TypedFuncs[*buildapi.Build]{
+		UpdateFunc: func(e event.TypedUpdateEvent[*buildapi.Build]) bool {
+			o := e.ObjectOld
+			n := e.ObjectNew
+
+			buildAtBuildDeletion := false
+
+			// Check if the Build retention AtBuildDeletion is updated
+			oldBuildRetention := o.Spec.Retention
+			newBuildRetention := n.Spec.Retention
+
+			logAndEnableDeletion := func() {
+				ctxlog.Debug(
+					ctx,
+					"updating predicated passed, the build retention AtBuildDeletion was modified.",
+					namespace,
+					n.GetNamespace(),
+					name,
+					n.GetName(),
+				)
+				buildAtBuildDeletion = true
+			}
+
+			xorBuildRetentions := func(oldDeletion, newDeletion *bool) bool {
+				if oldDeletion == nil {
+					oldDeletion = ptr.To(false)
+				}
+				if newDeletion == nil {
+					newDeletion = ptr.To(false)
+				}
+				return *oldDeletion != *newDeletion
+			}
+
+			if !reflect.DeepEqual(oldBuildRetention, newBuildRetention) {
+				switch {
+				case o.Spec.Retention == nil && n.Spec.Retention != nil:
+					if n.Spec.Retention.AtBuildDeletion != nil && *n.Spec.Retention.AtBuildDeletion {
+						logAndEnableDeletion()
+					}
+				case o.Spec.Retention != nil && n.Spec.Retention == nil:
+					if o.Spec.Retention.AtBuildDeletion != nil && *o.Spec.Retention.AtBuildDeletion {
+						logAndEnableDeletion()
+					}
+				case o.Spec.Retention != nil && n.Spec.Retention != nil:
+					if xorBuildRetentions(o.Spec.Retention.AtBuildDeletion, n.Spec.Retention.AtBuildDeletion) {
+						logAndEnableDeletion()
+					}
 				}
 			}
 
 			// Ignore updates to CR status in which case metadata.Generation does not change
 			// or BuildRunDeletion annotation does not change
-			return e.MetaOld.GetGeneration() != e.MetaNew.GetGeneration() || buildRunDeletionAnnotation
+			return o.GetGeneration() != n.GetGeneration() || buildAtBuildDeletion
 		},
-		DeleteFunc: func(e event.DeleteEvent) bool {
+		DeleteFunc: func(_ event.TypedDeleteEvent[*buildapi.Build]) bool {
 			// Never reconcile on deletion, there is nothing we have to do
 			return false
 		},
 	}
 
 	// Watch for changes to primary resource Build
-	if err = c.Watch(&source.Kind{Type: &build.Build{}}, &handler.EnqueueRequestForObject{}, pred); err != nil {
+	if err = c.Watch(source.Kind(mgr.GetCache(), &buildapi.Build{}, &handler.TypedEnqueueRequestForObject[*buildapi.Build]{}, pred)); err != nil {
 		return err
 	}
 
-	preSecret := predicate.Funcs{
-		// Only filter events where the secret have the Build specific annotation
-		CreateFunc: func(e event.CreateEvent) bool {
-			objectAnnotations := e.Meta.GetAnnotations()
-			if _, ok := buildCredentialsAnnotationExist(objectAnnotations); ok {
-				return true
+	return c.Watch(source.Kind(mgr.GetCache(), &corev1.Secret{}, handler.TypedEnqueueRequestsFromMapFunc(func(ctx context.Context, secret *corev1.Secret) []reconcile.Request {
+		buildList := &buildapi.BuildList{}
+
+		// List all builds in the namespace of the current secret
+		if err := mgr.GetClient().List(ctx, buildList, &client.ListOptions{Namespace: secret.Namespace}); err != nil {
+			// Avoid entering into the Reconcile space
+			ctxlog.Info(ctx, "unexpected error happened while listing builds", namespace, secret.Namespace, "error", err)
+			return []reconcile.Request{}
+		}
+
+		if len(buildList.Items) == 0 {
+			// Avoid entering into the Reconcile space
+			return []reconcile.Request{}
+		}
+
+		// Only enter the Reconcile space if the secret is referenced on
+		// any Build in the same namespaces
+
+		reconcileList := []reconcile.Request{}
+
+		for _, build := range buildList.Items {
+			// Check if this specific Build references the Secret in source or output
+			if (build.GetSourceCredentials() != nil && *build.GetSourceCredentials() == secret.Name) ||
+				(build.Spec.Output.PushSecret != nil && *build.Spec.Output.PushSecret == secret.Name) {
+
+				reconcileList = append(reconcileList, reconcile.Request{
+					NamespacedName: types.NamespacedName{
+						Name:      build.Name,
+						Namespace: build.Namespace,
+					},
+				})
 			}
-			return false
-		},
-
-		// Only filter events where the secret have the Build specific annotation,
-		// but only if the Build specific annotation changed
-		UpdateFunc: func(e event.UpdateEvent) bool {
-			oldAnnotations := e.MetaOld.GetAnnotations()
-			newAnnotations := e.MetaNew.GetAnnotations()
-
-			if _, oldBuildKey := buildCredentialsAnnotationExist(oldAnnotations); !oldBuildKey {
-				if _, newBuildKey := buildCredentialsAnnotationExist(newAnnotations); newBuildKey {
-					return true
-				}
-			}
-			return false
-		},
-
-		// Only filter events where the secret have the Build specific annotation
-		DeleteFunc: func(e event.DeleteEvent) bool {
-			objectAnnotations := e.Meta.GetAnnotations()
-			if _, ok := buildCredentialsAnnotationExist(objectAnnotations); ok {
-				return true
-			}
-			return false
-		},
-	}
-
-	return c.Watch(&source.Kind{Type: &corev1.Secret{}}, &handler.EnqueueRequestsFromMapFunc{
-		ToRequests: handler.ToRequestsFunc(func(o handler.MapObject) []reconcile.Request {
-
-			secret := o.Object.(*corev1.Secret)
-
-			buildList := &build.BuildList{}
-
-			// List all builds in the namespace of the current secret
-			if err := mgr.GetClient().List(ctx, buildList, &client.ListOptions{Namespace: secret.Namespace}); err != nil {
-				// Avoid entering into the Reconcile space
-				ctxlog.Info(ctx, "unexpected error happened while listing builds", namespace, secret.Namespace, "error", err)
-				return []reconcile.Request{}
-			}
-
-			if len(buildList.Items) == 0 {
-				// Avoid entering into the Reconcile space
-				return []reconcile.Request{}
-			}
-
-			// Only enter the Reconcile space if the secret is referenced on
-			// any Build in the same namespaces
-
-			reconcileList := []reconcile.Request{}
-			flagReconcile := false
-
-			for _, build := range buildList.Items {
-				if build.Spec.Source.Credentials != nil {
-					if build.Spec.Source.Credentials.Name == secret.Name {
-						flagReconcile = true
-					}
-				}
-				if build.Spec.Output.Credentials != nil {
-					if build.Spec.Output.Credentials.Name == secret.Name {
-						flagReconcile = true
-					}
-				}
-				if build.Spec.Builder != nil && build.Spec.Builder.Credentials != nil {
-					if build.Spec.Builder.Credentials.Name == secret.Name {
-						flagReconcile = true
-					}
-				}
-				if flagReconcile {
-					reconcileList = append(reconcileList, reconcile.Request{
-						NamespacedName: types.NamespacedName{
-							Name:      build.Name,
-							Namespace: build.Namespace,
-						},
-					})
-				}
-			}
-			return reconcileList
-		}),
-	}, preSecret)
-}
-
-func buildCredentialsAnnotationExist(annotation map[string]string) (string, bool) {
-	if val, ok := annotation[build.AnnotationBuildRefSecret]; ok {
-		return val, true
-	}
-	return "", false
+		}
+		return reconcileList
+	})))
 }

@@ -8,21 +8,18 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"runtime"
-
-	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 
 	"github.com/spf13/pflag"
 	"github.com/tektoncd/pipeline/pkg/apis/pipeline"
 	pipelinev1beta1 "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1beta1"
-
 	"k8s.io/apimachinery/pkg/api/meta"
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 	"sigs.k8s.io/controller-runtime/pkg/client/config"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/manager/signals"
+	"sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	buildconfig "github.com/shipwright-io/build/pkg/config"
 	"github.com/shipwright-io/build/pkg/controller"
@@ -91,8 +88,9 @@ func main() {
 		LeaseDuration:           buildCfg.ManagerOptions.LeaseDuration,
 		RenewDeadline:           buildCfg.ManagerOptions.RenewDeadline,
 		RetryPeriod:             buildCfg.ManagerOptions.RetryPeriod,
-		Namespace:               "",
-		MetricsBindAddress:      fmt.Sprintf("%s:%d", metricsHost, metricsPort),
+		Metrics: server.Options{
+			BindAddress: fmt.Sprintf("%s:%d", metricsHost, metricsPort),
+		},
 	})
 	if err != nil {
 		ctxlog.Error(ctx, err, "")
@@ -110,7 +108,8 @@ func main() {
 
 		// we also want to put this into the termination log
 		// so that user can see this message as the reason pod failed
-		if err := ioutil.WriteFile(buildCfg.TerminationLogPath, []byte(msg), 0644); err != nil {
+		// #nosec G306 the file must be readable by build steps that potentially run as a different user
+		if err := os.WriteFile(buildCfg.TerminationLogPath, []byte(msg), 0644); err != nil {
 			ctxlog.Error(ctx, err, "Error while trying to write to termination log")
 		}
 
@@ -123,7 +122,7 @@ func main() {
 	// Add optionally configured extra handlers to metrics endpoint
 	for path, handler := range buildMetrics.ExtraHandlers() {
 		ctxlog.Info(ctx, "Adding metrics extra handler path", "path", path)
-		if err := mgr.AddMetricsExtraHandler(path, handler); err != nil {
+		if err := mgr.AddMetricsServerExtraHandler(path, handler); err != nil {
 			ctxlog.Error(ctx, err, "")
 			os.Exit(2)
 		}
